@@ -1,4 +1,4 @@
-# DMAP.py
+# src/dmae/DMAP.py
 from __future__ import annotations
 
 import json
@@ -13,8 +13,8 @@ import jax.numpy as jnp
 from flax.core import freeze, unfreeze
 from flax.serialization import msgpack_serialize, msgpack_restore
 
-from ._dmap import dmap as DMAPFlax
-from .eager_dmap import eager_dmap
+from .blocks import dmap as DMAPFlax
+from .eager_map import eager_dmap_sparse  # <- your simplified sparse eager init
 
 
 BetaSpec = Union[float, Tuple[float, ...]]
@@ -25,34 +25,30 @@ class DMAPConfig:
     # architecture
     d: int = 16
     h: int = 1
-    alpha: float = 1.0
+    α: float = 1.0
     eps: float = 1e-12
 
     # metric
     mahalanobis: bool = False
-    metric_rank: Optional[int] = None  # None => full-rank (D) inside SMD
+    metric_rank: Optional[int] = None  # None => full-rank (D)
 
-    # eager init / spectral
+    # eager init (sparse)
     t: int = 1
-    beta_mode: str = "per_head"    # "shared" | "per_head"
-    zero_diag: bool = True
-    k_eigs: Optional[int] = None   # None => head_dim + 1
-    which: str = "LA"              # eigsh mode
-
-    # optional metric init (only used if mahalanobis and no weights)
-    metric_init: str = "euclidean"     # "euclidean" | "wishart_mix"
-    metric_mix: float = 0.1
+    k_nn: int = 64
+    q_block: int = 1024
+    r_block: int = 8192
+    k_eigs: Optional[int] = None  # None => head_dim + 1 (includes trivial)
 
 
 class DMAP:
     """
-    Wrapper around the Flax DMAP encoder.
+    Wrapper around the Flax DMAP encoder in blocks.py.
 
-    - "Training" in __init__ means: eager spectral init (O(h*N^2) kernel + Lanczos).
-      You can add SGD fine-tuning later, but this gives a strong geometric starting point.
-    - Inference in __call__ uses jitted Flax apply.
-    - save/load like a normal Flax model: config.json + flax_model.msgpack,
-      with optional push_to_hub / from_pretrained.
+    If params are not provided, this runs sparse eager diffusion-map init:
+      - anchors R_iX are set to the provided R_iX
+      - q (Coifman–Lafon) is set from the kernel row-sums
+      - W is filled from diffusion coordinates of the anchors
+        (packed into per-head slices of size head_dim inside the last dim d)
     """
 
     CONFIG_NAME = "config.json"
@@ -63,14 +59,10 @@ class DMAP:
         R_iX: Any,
         *,
         config: DMAPConfig | None = None,
-        beta: float | Sequence[float] | None = None,
+        β: float | Sequence[float] | None = None,
         params: Optional[Dict[str, Any]] = None,
         seed: int = 0,
     ):
-        """
-        If `params` is provided, uses it directly.
-        Otherwise computes eager initialization from `R_iX` using eager_dmap.py.
-        """
         self.cfg = config or DMAPConfig()
 
         R_iX = jnp.asarray(R_iX, dtype=jnp.float32)
@@ -82,63 +74,74 @@ class DMAP:
             raise ValueError(f"Need d % h == 0, got d={self.cfg.d}, h={self.cfg.h}.")
         self.head_dim = self.cfg.d // self.cfg.h
 
-        # Decide betas (per head) for the Flax module field β
-        beta_heads = self._normalize_beta(beta, self.cfg.h)
+        β_heads = self._normalize_beta(β, self.cfg.h)  # (h,)
 
-        # Flax module (β is stored in the module fields, not params)
+        # Flax module (β is a module field, not a param)
         self.model = DMAPFlax(
-            d=self.cfg.d,
-            N=self.N,
-            h=self.cfg.h,
-            α=float(self.cfg.alpha),
-            β=tuple(float(b) for b in beta_heads),
+            d=int(self.cfg.d),
+            N=int(self.N),
+            h=int(self.cfg.h),
+            α=float(self.cfg.α),
+            β=tuple(float(b) for b in β_heads.tolist()),
             mahalanobis=bool(self.cfg.mahalanobis),
             metric_rank=self.cfg.metric_rank,
             eps=float(self.cfg.eps),
         )
 
         if params is None:
-            # Eager init: returns params compatible with your Flax module param tree
-            init = eager_dmap(
-                R_iX=jax.device_get(R_iX),     # eager code uses numpy/scipy
-                head_dim=self.head_dim,
-                h=self.cfg.h,
-                alpha=self.cfg.alpha,
-                t=self.cfg.t,
-                beta=None if beta is None else float(beta_heads[0]),
-                beta_mode=self.cfg.beta_mode,
-                mahalanobis=self.cfg.mahalanobis,
-                metric_rank=self.cfg.metric_rank,
-                metric_init=self.cfg.metric_init,
-                metric_mix=self.cfg.metric_mix,
-                zero_diag=self.cfg.zero_diag,
-                k_eigs=self.cfg.k_eigs,
-                which=self.cfg.which,
-                eps=self.cfg.eps,
-                seed=seed,
+            # --- initialize metric factor L if needed and not provided ---
+            L0 = None
+            if self.cfg.mahalanobis:
+                r = self.D if self.cfg.metric_rank is None else int(self.cfg.metric_rank)
+                if r <= 0 or r > self.D:
+                    raise ValueError(f"metric_rank must be in [1,D], got {r} for D={self.D}.")
+                I = jnp.eye(self.D, dtype=jnp.float32)[:, :r]              # (D,r)
+                L0 = jnp.broadcast_to(I[None, :, :], (self.cfg.h, self.D, r))  # (h,D,r)
+
+            # choose eig count including trivial mode
+            k_total = self.cfg.k_eigs
+            if k_total is None:
+                k_total = self.head_dim + 1
+
+            # force eager to use exactly h heads: pass β as length-h vector
+            init = eager_dmap_sparse(
+                R_iX=jax.device_get(R_iX),
+                α=float(self.cfg.α),
+                t=int(self.cfg.t),
+                β=jax.device_get(β_heads).tolist(),
+                L=None if L0 is None else jax.device_get(L0),
+                k_nn=int(self.cfg.k_nn),
+                q_block=int(self.cfg.q_block),
+                r_block=int(self.cfg.r_block),
+                k_eigs=int(k_total),
+                ϵ=float(self.cfg.eps),
+                seed=int(seed),
             )
 
-            # Use the eager betas if user didn't specify beta
-            if beta is None:
-                beta_heads = jax.device_get(init["beta_heads"]).tolist()
-                # rebuild model with these betas
-                self.model = DMAPFlax(
-                    d=self.cfg.d,
-                    N=self.N,
-                    h=self.cfg.h,
-                    α=float(self.cfg.alpha),
-                    β=tuple(float(b) for b in beta_heads),
-                    mahalanobis=bool(self.cfg.mahalanobis),
-                    metric_rank=self.cfg.metric_rank,
-                    eps=float(self.cfg.eps),
-                )
+            # init outputs: q (h,N), W_spec (h,N,head_dim)
+            q = init["q"]                 # (h,N)
+            W_spec = init["W"]            # (h,N,head_dim) because k_eigs=head_dim+1
 
-            params = init["params"]
+            # pack W_spec into (h,N,d) by placing each head in its slice
+            W_full = np.zeros((self.cfg.h, self.N, self.cfg.d), dtype=np.float32)
+            for hh in range(self.cfg.h):
+                s = hh * self.head_dim
+                e = (hh + 1) * self.head_dim
+                W_full[hh, :, s:e] = W_spec[hh]
 
-        # Store params as FrozenDict (Flax-friendly)
+            params = {
+                "SMD": {"R_iX": jax.device_get(R_iX).astype("float32")},
+                "W": W_full,
+            }
+
+            if self.cfg.mahalanobis:
+                params["SMD"]["L"] = jax.device_get(L0).astype("float32")
+
+            # Only include q if α != 0 (Softmax won’t create/use it otherwise)
+            if float(self.cfg.α) != 0.0:
+                params["cl_softmax"] = {"q": np.asarray(q, dtype=np.float32)}
+
         self.params = freeze(self._to_jax_tree(params))
-
-        # JIT apply
         self._apply_jit = jax.jit(lambda p, x: self.model.apply({"params": p}, x))
 
     def __call__(self, R_aX: Any) -> jnp.ndarray:
@@ -153,21 +156,18 @@ class DMAP:
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # config.json includes wrapper config + shape info + module config (for safety)
         payload = {
             "wrapper_config": asdict(self.cfg),
             "N": self.N,
             "D": self.D,
-            "flax_module_config": self.model.config,  # relies on your _dmap.py dmap.config
+            "flax_module_config": self.model.config,
         }
         (save_dir / self.CONFIG_NAME).write_text(
             json.dumps(payload, indent=2, ensure_ascii=False)
         )
 
-        # flax_model.msgpack: serialize params pytree
         params_py = unfreeze(self.params)
-        weights_bytes = msgpack_serialize(params_py)  # :contentReference[oaicite:2]{index=2}
-        (save_dir / self.WEIGHTS_NAME).write_bytes(weights_bytes)
+        (save_dir / self.WEIGHTS_NAME).write_bytes(msgpack_serialize(params_py))
 
     @classmethod
     def from_pretrained(
@@ -178,18 +178,12 @@ class DMAP:
         revision: Optional[str] = None,
         R_iX: Any = None,
         seed: int = 0,
+        β: float | Sequence[float] | None = None,
     ) -> "DMAP":
-        """
-        Load from local folder or HF repo id.
-
-        If weights are missing but config exists, and you provide R_iX,
-        it will run eager init to reconstruct weights.
-        """
         path = Path(path_or_repo_id)
         if path.exists() and path.is_dir():
             local_dir = path
         else:
-            # HF download
             local_dir = Path(_hf_snapshot_download(path_or_repo_id, token=token, revision=revision))
 
         cfg_path = local_dir / cls.CONFIG_NAME
@@ -203,19 +197,16 @@ class DMAP:
 
         weights_path = local_dir / cls.WEIGHTS_NAME
         if weights_path.exists():
-            params = msgpack_restore(weights_path.read_bytes())  # :contentReference[oaicite:3]{index=3}
-            # If R_iX not provided, anchors come from params; good.
+            params = msgpack_restore(weights_path.read_bytes())
             if R_iX is None:
-                # fabricate R_iX just to satisfy constructor shape checks (won't be used if params provided)
                 R_iX = jnp.zeros((N, D), dtype=jnp.float32)
-            return cls(R_iX, config=wrapper_cfg, params=params, seed=seed)
+            return cls(R_iX, config=wrapper_cfg, params=params, seed=seed, β=β)
 
-        # No weights: recompute eagerly if R_iX provided
         if R_iX is None:
             raise FileNotFoundError(
                 f"Missing {cls.WEIGHTS_NAME} in {local_dir}. Provide R_iX to recompute eagerly."
             )
-        return cls(R_iX, config=wrapper_cfg, params=None, seed=seed)
+        return cls(R_iX, config=wrapper_cfg, params=None, seed=seed, β=β)
 
     # ---------------------------
     # HF Hub helpers
@@ -229,10 +220,6 @@ class DMAP:
         private: bool = False,
         commit_message: str = "Add DMAP Flax model",
     ) -> None:
-        """
-        Save to a temp folder then upload to Hugging Face Hub.
-        Uses huggingface_hub upload_folder / create_repo. :contentReference[oaicite:4]{index=4}
-        """
         token = token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -252,17 +239,15 @@ class DMAP:
     @staticmethod
     def _normalize_beta(beta: float | Sequence[float] | None, h: int) -> jnp.ndarray:
         if beta is None:
-            # placeholder; eager init will likely override if beta_mode uses median heuristic
             return jnp.ones((h,), dtype=jnp.float32)
         if isinstance(beta, (list, tuple)):
             if len(beta) != h:
-                raise ValueError(f"beta list/tuple must have length h={h}, got {len(beta)}.")
+                raise ValueError(f"β list/tuple must have length h={h}, got {len(beta)}.")
             return jnp.asarray([float(b) for b in beta], dtype=jnp.float32)
         return jnp.full((h,), float(beta), dtype=jnp.float32)
 
     @staticmethod
     def _to_jax_tree(tree: Any) -> Any:
-        # convert numpy leaves to jax arrays recursively
         if isinstance(tree, dict):
             return {k: DMAP._to_jax_tree(v) for k, v in tree.items()}
         if isinstance(tree, (list, tuple)):
@@ -277,7 +262,7 @@ class DMAP:
 
 
 def _hf_snapshot_download(repo_id: str, *, token: Optional[str], revision: Optional[str]) -> str:
-    from huggingface_hub import snapshot_download  # :contentReference[oaicite:5]{index=5}
+    from huggingface_hub import snapshot_download
     return snapshot_download(repo_id=repo_id, token=token, revision=revision)
 
 
@@ -289,7 +274,7 @@ def _hf_upload_folder(
     private: bool,
     commit_message: str,
 ) -> None:
-    from huggingface_hub import create_repo, upload_folder  # :contentReference[oaicite:6]{index=6}
+    from huggingface_hub import create_repo, upload_folder
     create_repo(repo_id, token=token, private=private, exist_ok=True)
     upload_folder(
         repo_id=repo_id,
