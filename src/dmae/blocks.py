@@ -1,4 +1,4 @@
-# _dmap.py # src/dmae/blocks.py
+# src/dmae/blocks.py
 # Core DMAP encoder building blocks (to be wrapped later, e.g. in `DMAP.py`)
 #
 # Goals:
