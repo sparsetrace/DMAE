@@ -1,12 +1,48 @@
-# src/dmae/blocks.py
-# Core DMAP encoder building blocks (to be wrapped later, e.g. in `DMAP.py`)
+# This file defines the core multi-head kernel blocks for a trainable DMAE-style
+# model family. It provides five main components: `RBF`, `Norm`, `dmap`, `nwlm`,
+# and `gplm`.
 #
-# Goals:
-# - Keep things minimal and NN-friendly.
-# - Multi-head works like MHSA structurally: per-head scores -> per-head weights -> per-head value map -> concat.
-# - Geometric: distances are symmetric; metric is global (sample-location independent).
-# - SMD can be Euclidean (no extra metric params) or Mahalanobis (global PSD metric factor L).
-# - All classes include config/from_config for save/load.
+# `RBF` is the shared kernel layer. It learns anchor points and computes Gaussian
+# radial-basis affinities between inputs and anchors. In Euclidean mode it uses
+# ordinary squared distance; when `metric_rank` is an integer, it instead uses a
+# per-head low-rank Mahalanobis factor `L`, so each head measures distance in its
+# own learned metric. The output is a tensor of positive kernel weights with shape
+# `(..., h, N)`.
+#
+# `Norm` performs Coifman–Lafon normalization followed by row normalization. It
+# takes positive kernel weights, optionally applies a trainable per-head density
+# correction `q`, scales by the exponent `α`, and then normalizes rows so the last
+# axis sums to one. This is the normalization used by the DMAP-style encoder and
+# the NWLM decoder.
+#
+# `dmap` is the multi-head encoder. For an ambient input `x`, it applies
+# `RBF -> Norm -> Linear` independently across heads. The learned linear map for
+# each head has shape `(N, d)`, so each head produces a latent feature block of
+# size `d`. The encoder does not concatenate heads; it returns latent features in
+# matrix form with shape `(..., h, d)`.
+#
+# `nwlm` is the normalized kernel decoder. It expects head-structured latent input
+# `(..., h, d)`. For each head it computes kernel weights against learned latent
+# anchors, applies `Norm`, and maps the normalized weights through a learned
+# linear value map to produce a per-head output block. These head outputs are then
+# concatenated. If `use_W_O=True`, a final learned output projection `W^O` maps
+# the concatenated decoder output to the requested output dimension.
+#
+# `gplm` is the unnormalized kernel decoder. It has the same overall structure as
+# `nwlm`, except that after the RBF computation it skips normalization and applies
+# the linear value map directly. This makes it the simpler kernel-regression-style
+# decoder. Like `nwlm`, it concatenates head outputs automatically and can
+# optionally apply a final projection `W^O`.
+#
+# In short, the file implements a consistent multi-head architecture:
+# - `dmap`: `RBF -> Norm -> Linear`
+# - `nwlm`: `RBF -> Norm -> Linear`
+# - `gplm`: `RBF -> Linear`
+#
+# The encoder keeps the head dimension explicit, while both decoders merge head
+# outputs into one feature vector and can optionally project that vector into the
+# final output space.
+
 
 from __future__ import annotations
 
@@ -19,29 +55,31 @@ import flax.linen as nn
 BetaSpec = Union[float, Tuple[float, ...]]
 
 
-class SMD(nn.Module):
+class RBF(nn.Module):
     """
-    Squared distance to anchors, multi-head.
+    Multi-head RBF kernel layer with learned anchors and optional Mahalanobis factor.
 
-    Anchors are shared across heads (compression-friendly):
-      R_iX: (N, D)
+    For each head h and anchor i:
+        K_h(x, R_i) = exp( -β_h * d_h^2(x, R_i) )
 
-    Euclidean (mahalanobis=False):
-      d_h^2(x, R_i) = ||x - R_i||^2   (same across heads; heads differ via β_h, q_h, W_h)
+    Euclidean:
+        if metric_rank is None
+        d_h^2(x, R_i) = ||x - R_i||^2
 
-    Mahalanobis (mahalanobis=True), per-head global PSD metric M_h = L_h L_h^T:
-      d_h^2(x, R_i) = || (x - R_i) L_h ||^2
-      L: (h, D, r), where r defaults to D (full rank) if metric_rank is None
+    Mahalanobis:
+        if metric_rank = r is an int
+        d_h^2(x, R_i) = ||(x - R_i) L_h||^2
+        with L: (h, D, r)
 
     Shapes:
-      x: (..., D)
-      out: (..., h, N)
+        x:   (..., D)
+        out: (..., h, N)
     """
     N: int
     h: int = 1
 
-    mahalanobis: bool = False
-    metric_rank: Optional[int] = None  # if None and mahalanobis=True, uses r=D
+    β: BetaSpec = 1.0
+    metric_rank: Optional[int] = None
 
     eps: float = 1e-12
     dtype: Any = jnp.float32
@@ -52,7 +90,6 @@ class SMD(nn.Module):
         x = jnp.asarray(x, self.dtype)
         D = x.shape[-1]
 
-        # Shared anchors
         R = self.param(
             "R_iX",
             nn.initializers.lecun_normal(),
@@ -60,63 +97,86 @@ class SMD(nn.Module):
             self.param_dtype,
         )  # (N, D)
 
-        # Base Euclidean dist^2: (..., N)
-        x2 = jnp.sum(x * x, axis=-1, keepdims=True)  # (..., 1)
-        cross = -2.0 * (x @ R.T)                     # (..., N)
-        R2 = jnp.sum(R * R, axis=-1)                 # (N,)
-        dist2 = jnp.maximum(x2 + cross + R2, 0.0).astype(self.dtype)  # (..., N)
+        if isinstance(self.β, tuple):
+            if len(self.β) != self.h:
+                raise ValueError(f"β tuple must have length h={self.h}, got {len(self.β)}.")
+            beta = jnp.asarray(self.β, dtype=self.dtype)
+        else:
+            beta = jnp.full((self.h,), float(self.β), dtype=self.dtype)
 
-        if not self.mahalanobis:
-            # Broadcast Euclidean dist to heads: (..., h, N)
-            dist2_h = dist2[..., None, :]  # (..., 1, N)
+        if self.metric_rank is None:
+            x2 = jnp.sum(x * x, axis=-1, keepdims=True)   # (..., 1)
+            cross = -2.0 * (x @ R.T)                      # (..., N)
+            R2 = jnp.sum(R * R, axis=-1)                  # (N,)
+            dist2 = jnp.maximum(x2 + cross + R2, 0.0)     # (..., N)
+
+            dist2_h = dist2[..., None, :]
             if self.h != 1:
-                dist2_h = jnp.broadcast_to(dist2_h, dist2.shape[:-1] + (self.h, self.N))
-            return dist2_h.astype(self.dtype)
+                dist2_h = jnp.broadcast_to(
+                    dist2_h,
+                    dist2.shape[:-1] + (self.h, self.N),
+                )
+        else:
+            r = int(self.metric_rank)
+            if r <= 0 or r > D:
+                raise ValueError(f"RBF.metric_rank must be in [1, D], got r={r}, D={D}.")
 
-        # Mahalanobis: per-head projection
-        r = int(self.metric_rank) if (self.metric_rank is not None) else int(D)
-        if r <= 0 or r > D:
-            raise ValueError(f"SMD.metric_rank must be in [1, D], got r={r}, D={D}.")
+            L = self.param(
+                "L",
+                nn.initializers.lecun_normal(),
+                (self.h, D, r),
+                self.param_dtype,
+            )  # (h, D, r)
 
-        L = self.param(
-            "L",
-            nn.initializers.lecun_normal(),
-            (self.h, D, r),
-            self.param_dtype,
-        )  # (h, D, r)
+            xh = jnp.einsum("...d,hdr->...hr", x, L)      # (..., h, r)
+            Rh = jnp.einsum("nd,hdr->hnr", R, L)          # (h, N, r)
 
-        # Project: x_h = x @ L_h, R_h = R @ L_h
-        xh = jnp.einsum("...d,hdr->...hr", x, L)   # (..., h, r)
-        Rh = jnp.einsum("nd,hdr->hnr", R, L)       # (h, N, r)
+            xh2 = jnp.sum(xh * xh, axis=-1, keepdims=True)              # (..., h, 1)
+            Rh2 = jnp.sum(Rh * Rh, axis=-1)                             # (h, N)
+            cross_h = -2.0 * jnp.einsum("...hr,hnr->...hn", xh, Rh)     # (..., h, N)
+            dist2_h = jnp.maximum(xh2 + cross_h + Rh2, 0.0)
 
-        # dist^2 in projected space: (..., h, N)
-        xh2 = jnp.sum(xh * xh, axis=-1, keepdims=True)                 # (..., h, 1)
-        Rh2 = jnp.sum(Rh * Rh, axis=-1)                                # (h, N)
-        cross_h = -2.0 * jnp.einsum("...hr,hnr->...hn", xh, Rh)        # (..., h, N)
-        dist2_h = jnp.maximum(xh2 + cross_h + Rh2, 0.0)                # (..., h, N)
-        return dist2_h.astype(self.dtype)
+        beta = beta.reshape((1,) * (dist2_h.ndim - 2) + (self.h, 1))
+        K = jnp.exp(-beta * dist2_h)
+        return K.astype(self.dtype)
 
     @property
     def config(self) -> Dict[str, Any]:
+        beta_cfg: Any = [float(b) for b in self.β] if isinstance(self.β, tuple) else float(self.β)
         return {
             "N": int(self.N),
             "h": int(self.h),
-            "mahalanobis": bool(self.mahalanobis),
+            "β": beta_cfg,
             "metric_rank": None if self.metric_rank is None else int(self.metric_rank),
             "eps": float(self.eps),
         }
 
     @classmethod
-    def from_config(cls, cfg: Dict[str, Any]) -> "SMD":
+    def from_config(cls, cfg: Dict[str, Any]) -> "RBF":
+        beta_cfg = cfg.get("β", cfg.get("beta", 1.0))
+        beta_val: BetaSpec = tuple(float(b) for b in beta_cfg) if isinstance(beta_cfg, list) else float(beta_cfg)
         return cls(
             N=int(cfg["N"]),
             h=int(cfg.get("h", 1)),
-            mahalanobis=bool(cfg.get("mahalanobis", False)),
+            β=beta_val,
             metric_rank=cfg.get("metric_rank", None),
             eps=float(cfg.get("eps", 1e-12)),
         )
 
-class Softmax(nn.Module):
+
+class Norm(nn.Module):
+    """
+    Coifman-Lafon normalization followed by row normalization.
+
+    Given positive affinities K_{...hi}:
+        Ksum_a = sum_i K_{ahi}
+        Ktilde_{ahi} = Ksum_a^{-α} * K_{ahi} * q_{hi}^{-α}
+        P_{ahi} = Ktilde_{ahi} / sum_i Ktilde_{ahi}
+
+    Shapes:
+        K:   (..., h, N) or (..., N)
+        out: same shape as K
+    """
     N: int
     α: float = 0.0
     h: int = 1
@@ -127,31 +187,30 @@ class Softmax(nn.Module):
     param_dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, logits: jnp.ndarray) -> jnp.ndarray:
-        logits = jnp.asarray(logits, self.dtype)
-        if logits.shape[-1] != self.N:
-            raise ValueError(f"Softmax expected last dim {self.N}, got {logits.shape[-1]}.")
+    def __call__(self, K: jnp.ndarray) -> jnp.ndarray:
+        K = jnp.asarray(K, self.dtype)
+        if K.shape[-1] != self.N:
+            raise ValueError(f"Norm expected last dim {self.N}, got {K.shape[-1]}.")
 
-        # stable exp
-        z = logits - jnp.max(logits, axis=-1, keepdims=True)
-        w = jnp.exp(z)
-
-        # Detect whether logits has a head axis (..., h, N)
-        has_head_axis = (logits.ndim >= 2) and (logits.shape[-2] == self.h)
+        K = jnp.maximum(K, 0.0)
+        has_head_axis = (K.ndim >= 2) and (K.shape[-2] == self.h)
 
         if self.α != 0.0:
+            Ksum = jnp.sum(K, axis=-1, keepdims=True)
+            Ksum = jnp.maximum(Ksum, self.eps)
+
             if self.per_head_q and has_head_axis:
-                # q is per-head even when h==1 (shape (1,N))
                 q_raw = self.param("q", nn.initializers.ones, (self.h, self.N), self.param_dtype)
-                q = nn.relu(q_raw) + self.eps                       # (h, N)
-                w = w * (q ** (-self.α))                            # broadcast to (..., h, N)
+                q = nn.relu(q_raw) + self.eps
+                K = (Ksum ** (-self.α)) * K * (q ** (-self.α))
             else:
                 q_raw = self.param("q", nn.initializers.ones, (self.N,), self.param_dtype)
-                q = nn.relu(q_raw) + self.eps                       # (N,)
-                w = w * (q ** (-self.α))                            # broadcast to (..., N)
+                q = nn.relu(q_raw) + self.eps
+                K = (Ksum ** (-self.α)) * K * (q ** (-self.α))
 
-        s = jnp.sum(w, axis=-1, keepdims=True)
-        return (w / (s + self.eps)).astype(self.dtype)
+        row_sum = jnp.sum(K, axis=-1, keepdims=True)
+        row_sum = jnp.maximum(row_sum, self.eps)
+        return (K / row_sum).astype(self.dtype)
 
     @property
     def config(self) -> Dict[str, Any]:
@@ -164,7 +223,7 @@ class Softmax(nn.Module):
         }
 
     @classmethod
-    def from_config(cls, cfg: Dict[str, Any]) -> "Softmax":
+    def from_config(cls, cfg: Dict[str, Any]) -> "Norm":
         alpha = cfg.get("α", cfg.get("alpha", 0.0))
         return cls(
             N=int(cfg["N"]),
@@ -177,23 +236,21 @@ class Softmax(nn.Module):
 
 class dmap(nn.Module):
     """
-    Multi-head DMAP-style encoder (compression / encoder use-case).
+    Multi-head DMAP encoder.
 
-    Per-head:
-      dist2_h = SMD(x)                             # (..., h, N)
-      dist2_h = relu(β_h * dist2_h)                # positive safety, β is per-head
-      p_h     = CLSoftmax(logits=-dist2_h, α)      # (..., h, N)
-      y_h     = p_h @ W_h                          # (..., h, head_dim)
-    Output:
-      concat_h(y_h) -> (..., d)
+    Pipeline per head:
+        x -> RBF -> Norm -> Linear
 
-    Params:
-      d: total output dim (must be divisible by h)
-      N: number of anchors
-      h: number of heads
-      β: scalar or tuple of length h (per-head distance scale)
-      mahalanobis: if True, learns per-head metric factors L_h (global, location-independent)
-      metric_rank: if None and mahalanobis=True, uses full rank r=D
+    Output is NOT concatenated:
+        (..., h, d)
+
+    Parameters:
+        d: per-head latent dimension
+        N: number of encoder anchors
+        h: number of heads
+        β: scalar or per-head tuple
+        α: CL exponent
+        metric_rank: None => Euclidean, int => Mahalanobis rank
     """
     d: int
     N: int
@@ -201,77 +258,57 @@ class dmap(nn.Module):
 
     α: float = 1.0
     β: BetaSpec = 1.0
-
-    mahalanobis: bool = False
     metric_rank: Optional[int] = None
 
     eps: float = 1e-12
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = jnp.asarray(x, jnp.float32)
+        x = jnp.asarray(x, self.dtype)
 
-        if self.d % self.h != 0:
-            raise ValueError(f"dmap requires d % h == 0, got d={self.d}, h={self.h}.")
-        head_dim = self.d // self.h
-
-        dist2_h = SMD(
+        K = RBF(
             N=self.N,
             h=self.h,
-            mahalanobis=self.mahalanobis,
+            β=self.β,
             metric_rank=self.metric_rank,
             eps=self.eps,
-            name="SMD",
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="rbf",
         )(x)  # (..., h, N)
 
-        # Build per-head beta vector
-        if isinstance(self.β, tuple):
-            if len(self.β) != self.h:
-                raise ValueError(f"β tuple must have length h={self.h}, got {len(self.β)}.")
-            beta = jnp.asarray(self.β, dtype=jnp.float32)  # (h,)
-        else:
-            beta = jnp.full((self.h,), float(self.β), dtype=jnp.float32)
-
-        beta = beta.reshape((1,) * (dist2_h.ndim - 2) + (self.h, 1))  # broadcast to (..., h, 1)
-
-        dist2_h = nn.relu(dist2_h * beta)  # (..., h, N)
-        logits = -dist2_h
-
-        p = Softmax(
+        P = Norm(
             N=self.N,
             α=self.α,
             h=self.h,
             per_head_q=True,
             eps=self.eps,
-            name="cl_softmax",
-        )(logits)  # (..., h, N)
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            name="norm",
+        )(K)  # (..., h, N)
 
-        # Per-head value map W_h : (h, N, d)  <-- changed
         W = self.param(
             "W",
             nn.initializers.lecun_normal(),
             (self.h, self.N, self.d),
-            jnp.float32,
-        )
+            self.param_dtype,
+        )  # (h, N, d)
 
-        y = jnp.einsum("...hn,hnd->...hd", p, W)  # (..., h, d)  <-- already right
-        return y.astype(jnp.float32)
+        y = jnp.einsum("...hn,hnd->...hd", P, W)  # (..., h, d)
+        return y.astype(self.dtype)
 
     @property
     def config(self) -> Dict[str, Any]:
-        beta_cfg: Any
-        if isinstance(self.β, tuple):
-            beta_cfg = [float(b) for b in self.β]  # JSON-friendly
-        else:
-            beta_cfg = float(self.β)
-
+        beta_cfg: Any = [float(b) for b in self.β] if isinstance(self.β, tuple) else float(self.β)
         return {
             "d": int(self.d),
             "N": int(self.N),
             "h": int(self.h),
             "α": float(self.α),
             "β": beta_cfg,
-            "mahalanobis": bool(self.mahalanobis),
             "metric_rank": None if self.metric_rank is None else int(self.metric_rank),
             "eps": float(self.eps),
         }
@@ -279,171 +316,153 @@ class dmap(nn.Module):
     @classmethod
     def from_config(cls, cfg: Dict[str, Any]) -> "dmap":
         alpha = cfg.get("α", cfg.get("alpha", 1.0))
-
         beta_cfg = cfg.get("β", cfg.get("beta", 1.0))
-        if isinstance(beta_cfg, list):
-            beta_val: BetaSpec = tuple(float(b) for b in beta_cfg)
-        else:
-            beta_val = float(beta_cfg)
-
+        beta_val: BetaSpec = tuple(float(b) for b in beta_cfg) if isinstance(beta_cfg, list) else float(beta_cfg)
         return cls(
             d=int(cfg["d"]),
             N=int(cfg["N"]),
             h=int(cfg.get("h", 1)),
             α=float(alpha),
             β=beta_val,
-            mahalanobis=bool(cfg.get("mahalanobis", False)),
             metric_rank=cfg.get("metric_rank", None),
             eps=float(cfg.get("eps", 1e-12)),
         )
 
-# src/dima/_dmap.py  (or rename to blocks.py)
-from typing import Any, Dict, Optional, Tuple, Union
-# assumes SMD and Softmax are defined above in this same file
 
-BetaSpec = Union[float, Tuple[float, ...]]
-
-
-class kgpr(nn.Module):
+class nwlm(nn.Module):
     """
-    Kernel-GPR / Nyström-KRR decoder block (mean only), multihead-friendly.
+    Multi-head NWLM decoder.
 
-    dist2_h = SMD(z)                  # (..., h, M)
-    k_h     = exp(-β_h * dist2_h)     # (..., h, M)
-    y_h     = k_h @ M_hX              # (..., h, D)
-    output  = concat(y_h) or return per-head
+    Pipeline per head:
+        z_h -> RBF -> Norm -> Linear
 
-    Wrapper fills:
-      params["SMD"]["R_iX"] = inducing points Z  (M, d_lat)
-      params["M_hX"]        = weights            (h, M, D)
+    Input:
+        z: (..., h, d)
 
-    `β` is intended to already include any legacy scaling like (beta/eps).
+    Per-head output:
+        (..., h, D_head)
+
+    Final output:
+        concat heads -> (..., h * D_head)
+        optional W^O -> (..., D_out)
     """
-    D: int
-    M: int
+    D_head: int
+    N: int
     h: int = 1
-    β: BetaSpec = 1.0
 
-    concat_heads: bool = True  # if True -> (..., h*D); else -> (..., h, D)
+    α: float = 0.0
+    β: BetaSpec = 1.0
+    metric_rank: Optional[int] = None
+
+    use_W_O: bool = False
+    D_out: Optional[int] = None
 
     eps: float = 1e-12
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, z: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        z = jnp.asarray(z, self.dtype)  # (..., d_lat)
+    def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
+        z = jnp.asarray(z, self.dtype)
+        if z.ndim < 2 or z.shape[-2] != self.h:
+            raise ValueError(f"nwlm expected input shape (..., h, d) with h={self.h}, got {z.shape}.")
 
-        dist2_h = SMD(
-            N=self.M,
-            h=self.h,
-            mahalanobis=False,
-            eps=self.eps,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name="SMD",
-        )(z)  # (..., h, M)
+        d = z.shape[-1]
 
-        # β broadcast to (..., h, 1)
+        # Per-head anchors and optional Mahalanobis factors
+        R = self.param(
+            "R_ix",
+            nn.initializers.lecun_normal(),
+            (self.h, self.N, d),
+            self.param_dtype,
+        )  # (h, N, d)
+
         if isinstance(self.β, tuple):
             if len(self.β) != self.h:
                 raise ValueError(f"β tuple must have length h={self.h}, got {len(self.β)}.")
-            beta = jnp.asarray(self.β, dtype=jnp.float32)  # (h,)
+            beta = jnp.asarray(self.β, dtype=self.dtype)
         else:
-            beta = jnp.full((self.h,), float(self.β), dtype=jnp.float32)
-        beta = beta.reshape((1,) * (dist2_h.ndim - 2) + (self.h, 1))
+            beta = jnp.full((self.h,), float(self.β), dtype=self.dtype)
 
-        k_h = jnp.exp(-(beta * dist2_h)).astype(self.dtype)  # (..., h, M)
-
-        M_hX = self.param(
-            "M_hX",
-            nn.initializers.zeros,
-            (self.h, self.M, self.D),
-            self.param_dtype,
-        )  # (h, M, D)
-
-        y_h = jnp.einsum("...hm,hmd->...hd", k_h, M_hX).astype(self.dtype)  # (..., h, D)
-
-        if self.concat_heads:
-            return y_h.reshape(*y_h.shape[:-2], self.h * self.D)
-        return y_h
-
-    @property
-    def config(self) -> Dict[str, Any]:
-        beta_cfg: Any = [float(b) for b in self.β] if isinstance(self.β, tuple) else float(self.β)
-        return {
-            "D": int(self.D),
-            "M": int(self.M),
-            "h": int(self.h),
-            "β": beta_cfg,
-            "concat_heads": bool(self.concat_heads),
-            "eps": float(self.eps),
-        }
-
-    @classmethod
-    def from_config(cls, cfg: Dict[str, Any]) -> "kgpr":
-        beta_cfg = cfg.get("β", cfg.get("beta", 1.0))
-        if isinstance(beta_cfg, list):
-            beta_val: BetaSpec = tuple(float(b) for b in beta_cfg)
+        if self.metric_rank is None:
+            z2 = jnp.sum(z * z, axis=-1, keepdims=True)                        # (..., h, 1)
+            R2 = jnp.sum(R * R, axis=-1)                                       # (h, N)
+            cross = -2.0 * jnp.einsum("...hd,hnd->...hn", z, R)                # (..., h, N)
+            dist2 = jnp.maximum(z2 + cross + R2, 0.0)                          # (..., h, N)
         else:
-            beta_val = float(beta_cfg)
+            r = int(self.metric_rank)
+            if r <= 0 or r > d:
+                raise ValueError(f"nwlm.metric_rank must be in [1, d], got r={r}, d={d}.")
 
-        return cls(
-            D=int(cfg["D"]),
-            M=int(cfg["M"]),
-            h=int(cfg.get("h", 1)),
-            β=beta_val,
-            concat_heads=bool(cfg.get("concat_heads", True)),
-            eps=float(cfg.get("eps", 1e-12)),
-        )
+            L = self.param(
+                "L",
+                nn.initializers.lecun_normal(),
+                (self.h, d, r),
+                self.param_dtype,
+            )  # (h, d, r)
 
-# in _dmap.py (or blocks.py)
-class nwlm(nn.Module):
-    D: int
-    M: int
-    h: int = 1
+            zh = jnp.einsum("...hd,hdr->...hr", z, L)                          # (..., h, r)
+            Rh = jnp.einsum("hnd,hdr->hnr", R, L)                              # (h, N, r)
 
-    β: BetaSpec = 1.0
-    α: float = 0.0
+            zh2 = jnp.sum(zh * zh, axis=-1, keepdims=True)                     # (..., h, 1)
+            Rh2 = jnp.sum(Rh * Rh, axis=-1)                                    # (h, N)
+            cross = -2.0 * jnp.einsum("...hr,hnr->...hn", zh, Rh)              # (..., h, N)
+            dist2 = jnp.maximum(zh2 + cross + Rh2, 0.0)                        # (..., h, N)
 
-    # NEW:
-    mahalanobis: bool = False
-    metric_rank: Optional[int] = None
+        beta = beta.reshape((1,) * (dist2.ndim - 2) + (self.h, 1))
+        K = jnp.exp(-beta * dist2)                                             # (..., h, N)
 
-    concat_heads: bool = True
-    eps: float = 1e-12
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
-
-    @nn.compact
-    def __call__(self, z: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        z = jnp.asarray(z, self.dtype)
-
-        dist2_h = SMD(
-            N=self.M,
+        P = Norm(
+            N=self.N,
+            α=self.α,
             h=self.h,
-            mahalanobis=self.mahalanobis,      # <-- now configurable
-            metric_rank=self.metric_rank,      # <-- now configurable
+            per_head_q=True,
             eps=self.eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            name="SMD",
-        )(z)  # (..., h, M)
+            name="norm",
+        )(K)  # (..., h, N)
 
-        # ... rest unchanged ...
+        W = self.param(
+            "W",
+            nn.initializers.lecun_normal(),
+            (self.h, self.N, self.D_head),
+            self.param_dtype,
+        )  # (h, N, D_head)
+
+        y_h = jnp.einsum("...hn,hnd->...hd", P, W)  # (..., h, D_head)
+        y = y_h.reshape(*y_h.shape[:-2], self.h * self.D_head)  # (..., h*D_head)
+
+        if not self.use_W_O:
+            return y.astype(self.dtype)
+
+        D_out = self.h * self.D_head if self.D_out is None else int(self.D_out)
+        W_O = self.param(
+            "W_O",
+            nn.initializers.lecun_normal(),
+            (self.h * self.D_head, D_out),
+            self.param_dtype,
+        )
+        b_O = self.param(
+            "b_O",
+            nn.initializers.zeros,
+            (D_out,),
+            self.param_dtype,
+        )
+        return (y @ W_O + b_O).astype(self.dtype)
 
     @property
     def config(self) -> Dict[str, Any]:
         beta_cfg: Any = [float(b) for b in self.β] if isinstance(self.β, tuple) else float(self.β)
         return {
-            "D": int(self.D),
-            "M": int(self.M),
+            "D_head": int(self.D_head),
+            "N": int(self.N),
             "h": int(self.h),
-            "β": beta_cfg,
             "α": float(self.α),
-            "mahalanobis": bool(self.mahalanobis),                 # NEW
-            "metric_rank": None if self.metric_rank is None else int(self.metric_rank),  # NEW
-            "concat_heads": bool(self.concat_heads),
+            "β": beta_cfg,
+            "metric_rank": None if self.metric_rank is None else int(self.metric_rank),
+            "use_W_O": bool(self.use_W_O),
+            "D_out": None if self.D_out is None else int(self.D_out),
             "eps": float(self.eps),
         }
 
@@ -452,15 +471,153 @@ class nwlm(nn.Module):
         alpha = cfg.get("α", cfg.get("alpha", 0.0))
         beta_cfg = cfg.get("β", cfg.get("beta", 1.0))
         beta_val: BetaSpec = tuple(float(b) for b in beta_cfg) if isinstance(beta_cfg, list) else float(beta_cfg)
-
         return cls(
-            D=int(cfg["D"]),
-            M=int(cfg["M"]),
+            D_head=int(cfg["D_head"]),
+            N=int(cfg["N"]),
+            h=int(cfg.get("h", 1)),
+            α=float(alpha),
+            β=beta_val,
+            metric_rank=cfg.get("metric_rank", None),
+            use_W_O=bool(cfg.get("use_W_O", False)),
+            D_out=cfg.get("D_out", None),
+            eps=float(cfg.get("eps", 1e-12)),
+        )
+
+
+class gplm(nn.Module):
+    """
+    Multi-head GPLM decoder.
+
+    Pipeline per head:
+        z_h -> RBF -> Linear
+
+    Input:
+        z: (..., h, d)
+
+    Per-head output:
+        (..., h, D_head)
+
+    Final output:
+        concat heads -> (..., h * D_head)
+        optional W^O -> (..., D_out)
+    """
+    D_head: int
+    N: int
+    h: int = 1
+
+    β: BetaSpec = 1.0
+    metric_rank: Optional[int] = None
+
+    use_W_O: bool = False
+    D_out: Optional[int] = None
+
+    eps: float = 1e-12
+    dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
+
+    @nn.compact
+    def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
+        z = jnp.asarray(z, self.dtype)
+        if z.ndim < 2 or z.shape[-2] != self.h:
+            raise ValueError(f"gplm expected input shape (..., h, d) with h={self.h}, got {z.shape}.")
+
+        d = z.shape[-1]
+
+        R = self.param(
+            "R_ix",
+            nn.initializers.lecun_normal(),
+            (self.h, self.N, d),
+            self.param_dtype,
+        )  # (h, N, d)
+
+        if isinstance(self.β, tuple):
+            if len(self.β) != self.h:
+                raise ValueError(f"β tuple must have length h={self.h}, got {len(self.β)}.")
+            beta = jnp.asarray(self.β, dtype=self.dtype)
+        else:
+            beta = jnp.full((self.h,), float(self.β), dtype=self.dtype)
+
+        if self.metric_rank is None:
+            z2 = jnp.sum(z * z, axis=-1, keepdims=True)                        # (..., h, 1)
+            R2 = jnp.sum(R * R, axis=-1)                                       # (h, N)
+            cross = -2.0 * jnp.einsum("...hd,hnd->...hn", z, R)                # (..., h, N)
+            dist2 = jnp.maximum(z2 + cross + R2, 0.0)
+        else:
+            r = int(self.metric_rank)
+            if r <= 0 or r > d:
+                raise ValueError(f"gplm.metric_rank must be in [1, d], got r={r}, d={d}.")
+
+            L = self.param(
+                "L",
+                nn.initializers.lecun_normal(),
+                (self.h, d, r),
+                self.param_dtype,
+            )  # (h, d, r)
+
+            zh = jnp.einsum("...hd,hdr->...hr", z, L)                          # (..., h, r)
+            Rh = jnp.einsum("hnd,hdr->hnr", R, L)                              # (h, N, r)
+
+            zh2 = jnp.sum(zh * zh, axis=-1, keepdims=True)
+            Rh2 = jnp.sum(Rh * Rh, axis=-1)
+            cross = -2.0 * jnp.einsum("...hr,hnr->...hn", zh, Rh)
+            dist2 = jnp.maximum(zh2 + cross + Rh2, 0.0)
+
+        beta = beta.reshape((1,) * (dist2.ndim - 2) + (self.h, 1))
+        K = jnp.exp(-beta * dist2)                                             # (..., h, N)
+
+        W = self.param(
+            "W",
+            nn.initializers.lecun_normal(),
+            (self.h, self.N, self.D_head),
+            self.param_dtype,
+        )  # (h, N, D_head)
+
+        y_h = jnp.einsum("...hn,hnd->...hd", K, W)  # (..., h, D_head)
+        y = y_h.reshape(*y_h.shape[:-2], self.h * self.D_head)  # (..., h*D_head)
+
+        if not self.use_W_O:
+            return y.astype(self.dtype)
+
+        D_out = self.h * self.D_head if self.D_out is None else int(self.D_out)
+        W_O = self.param(
+            "W_O",
+            nn.initializers.lecun_normal(),
+            (self.h * self.D_head, D_out),
+            self.param_dtype,
+        )
+        b_O = self.param(
+            "b_O",
+            nn.initializers.zeros,
+            (D_out,),
+            self.param_dtype,
+        )
+        return (y @ W_O + b_O).astype(self.dtype)
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        beta_cfg: Any = [float(b) for b in self.β] if isinstance(self.β, tuple) else float(self.β)
+        return {
+            "D_head": int(self.D_head),
+            "N": int(self.N),
+            "h": int(self.h),
+            "β": beta_cfg,
+            "metric_rank": None if self.metric_rank is None else int(self.metric_rank),
+            "use_W_O": bool(self.use_W_O),
+            "D_out": None if self.D_out is None else int(self.D_out),
+            "eps": float(self.eps),
+        }
+
+    @classmethod
+    def from_config(cls, cfg: Dict[str, Any]) -> "gplm":
+        beta_cfg = cfg.get("β", cfg.get("beta", 1.0))
+        beta_val: BetaSpec = tuple(float(b) for b in beta_cfg) if isinstance(beta_cfg, list) else float(beta_cfg)
+        return cls(
+            D_head=int(cfg["D_head"]),
+            N=int(cfg["N"]),
             h=int(cfg.get("h", 1)),
             β=beta_val,
-            α=float(alpha),
-            mahalanobis=bool(cfg.get("mahalanobis", False)),       # NEW
-            metric_rank=cfg.get("metric_rank", None),              # NEW
-            concat_heads=bool(cfg.get("concat_heads", True)),
+            metric_rank=cfg.get("metric_rank", None),
+            use_W_O=bool(cfg.get("use_W_O", False)),
+            D_out=cfg.get("D_out", None),
             eps=float(cfg.get("eps", 1e-12)),
         )
