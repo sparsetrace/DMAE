@@ -1,3 +1,4 @@
+# DMAP.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,33 +9,63 @@ import jax
 import jax.numpy as jnp
 from flax.core import freeze, unfreeze
 
-from .eager_map import eager_dmap_sparse
+from .eager_map import eager_dmap
 from .blocks import dmap
 
 
 BetaSpec = Union[float, Tuple[float, ...]]
 
 
+def _resolve_scalar_alias(
+    greek_name: str,
+    greek_val,
+    latin_name: str,
+    latin_val,
+    default: float,
+) -> float:
+    if greek_val is not None and latin_val is not None and float(greek_val) != float(latin_val):
+        raise ValueError(
+            f"Got both {greek_name}={greek_val} and {latin_name}={latin_val}; provide only one."
+        )
+    if greek_val is None and latin_val is None:
+        return float(default)
+    return float(latin_val) if greek_val is None else float(greek_val)
+
+
+def _resolve_beta_alias(
+    β,
+    beta,
+    default=None,
+):
+    if β is not None and beta is not None:
+        a = np.asarray(β if not np.isscalar(β) else [β], dtype=np.float64)
+        b = np.asarray(beta if not np.isscalar(beta) else [beta], dtype=np.float64)
+        if a.shape != b.shape or not np.allclose(a, b):
+            raise ValueError("Got both β and beta with different values; provide only one.")
+    if β is None and beta is None:
+        return default
+    return beta if β is None else β
+
+
 @dataclass
 class DMAPInit:
-    R_iX: np.ndarray
-    β: np.ndarray
-    q: np.ndarray
-    λ_x: np.ndarray
-    ψ_ix: np.ndarray
-    R_ix: np.ndarray
-    W_linear: np.ndarray
-    ε_kernel: np.ndarray
-    L: Optional[np.ndarray] = None
+    R_iX: np.ndarray                  # (N, D)
+    β: np.ndarray                     # (h,)
+    q: np.ndarray                     # (h, N)
+    W: np.ndarray                     # (h, N, d)
+    λ_x: np.ndarray                   # (h, d)
+    ψ_ix: np.ndarray                  # (h, N, d)
+    L: Optional[np.ndarray] = None    # (h, D, r)
 
 
 class DMAP:
     """
-    Eager-initialized wrapper around the trainable Flax `dmap` encoder.
+    Dense eager-initialized wrapper around the trainable Flax `dmap` encoder.
 
-    Usage:
-        encoder = DMAP(R_iX=train_X, d=16)
-        z = encoder(test_X)
+    Example
+    -------
+    encoder = DMAP(R_iX, d=2)
+    Z = encoder(R_iX)   # shape (N, h, d)
     """
 
     def __init__(
@@ -47,109 +78,86 @@ class DMAP:
         β: float | Tuple[float, ...] | np.ndarray | None = None,
         alpha: float | None = None,
         beta: float | Tuple[float, ...] | np.ndarray | None = None,
-        L: np.ndarray | None = None,
         t: int = 1,
-        k_nn: int = 64,
-        q_block: int = 1024,
-        r_block: int = 8192,
-        ϵ: float = 1e-12,
-        eps: float | None = None,
+        mahalanobis: bool = False,
+        Q: np.ndarray | None = None,
+        metric_rank: int | None = None,
+        metric_init: str = "euclidean",
+        metric_mix: float = 0.1,
+        zero_diag: bool = True,
+        k_eigs: int | None = None,
+        which: str = "LA",
+        eps: float = 1e-12,
         seed: int = 0,
         dtype: Any = jnp.float32,
         param_dtype: Any = jnp.float32,
-        ):
-        # Resolve aliases safely
-        if α is not None and alpha is not None and float(α) != float(alpha):
-            raise ValueError(f"Got both α={α} and alpha={alpha}; please provide only one.")
-        if β is not None and beta is not None:
-            β_arr = np.asarray(β if not np.isscalar(β) else [β], dtype=np.float64)
-            beta_arr = np.asarray(beta if not np.isscalar(beta) else [beta], dtype=np.float64)
-            if β_arr.shape != beta_arr.shape or not np.allclose(β_arr, beta_arr):
-                raise ValueError("Got both β and beta with different values; please provide only one.")
-        if eps is not None and float(ϵ) != float(eps):
-            raise ValueError(f"Got both ϵ={ϵ} and eps={eps}; please provide only one.")
-
-        α = 1.0 if (α is None and alpha is None) else (float(alpha) if α is None else float(α))
-        β = beta if β is None else β
-        ϵ = float(eps) if eps is not None else float(ϵ)
-        
-        
+    ):
         R_iX = np.asarray(R_iX, dtype=np.float32)
         if R_iX.ndim != 2:
             raise ValueError(f"R_iX must have shape (N, D), got {R_iX.shape}.")
 
         N, D = R_iX.shape
-
         if d <= 0:
             raise ValueError(f"`d` must be positive, got {d}.")
         if h <= 0:
             raise ValueError(f"`h` must be positive, got {h}.")
 
-        # Normalize beta input for eager_dmap_sparse
-        if β is None:
-            beta_eager = None
-        elif np.isscalar(β):
-            beta_eager = float(β)
-        else:
-            beta_eager = np.asarray(β, dtype=np.float64).reshape(-1)
-            if beta_eager.shape[0] != h:
-                raise ValueError(f"β must be scalar or length h={h}, got shape {beta_eager.shape}.")
+        α = _resolve_scalar_alias("α", α, "alpha", alpha, 1.0)
+        β = _resolve_beta_alias(β, beta, None)
 
-        metric_rank = None
-        if L is not None:
-            L = np.asarray(L, dtype=np.float32)
-            if L.ndim != 3 or L.shape[0] != h or L.shape[1] != D:
-                raise ValueError(f"L must have shape (h={h}, D={D}, r), got {L.shape}.")
-            metric_rank = int(L.shape[-1])
-
-        # eager solve
-        eager = eager_dmap_sparse(
+        # Dense eager solve
+        eager = eager_dmap(
             R_iX=R_iX,
-            α=float(α),
+            head_dim=int(d),
+            h=int(h),
+            alpha=float(α),
             t=int(t),
-            β=beta_eager,
-            L=None if L is None else np.asarray(L, dtype=np.float64),
-            k_nn=int(k_nn),
-            q_block=int(q_block),
-            r_block=int(r_block),
-            k_eigs=int(d + 1),   # eager drops trivial mode internally
-            ϵ=float(ϵ),
+            beta=β,
+            mahalanobis=bool(mahalanobis),
+            Q=Q,
+            metric_rank=metric_rank,
+            metric_init=metric_init,
+            metric_mix=float(metric_mix),
+            zero_diag=bool(zero_diag),
+            k_eigs=k_eigs,
+            which=which,
+            eps=float(eps),
             seed=int(seed),
         )
 
-        β_fit = np.asarray(eager["β"], dtype=np.float32)                    # (h,)
-        q_fit = np.asarray(eager["q"], dtype=np.float32)                    # (h, N)
-        λ_fit = np.asarray(eager["spectral"]["λ_x"], dtype=np.float32)      # (h, d)
-        ψ_fit = np.asarray(eager["spectral"]["ψ_ix"], dtype=np.float32)     # (h, N, d)
-        R_ix = np.asarray(eager["W"], dtype=np.float32)                     # (h, N, d)
-        ε_kernel = np.asarray(eager["ε_kernel"], dtype=np.float32)          # (h,)
+        params_eager = eager["params"]
 
-        if λ_fit.shape != (h, d):
-            raise ValueError(f"Expected λ_x shape {(h, d)}, got {λ_fit.shape}.")
-        if ψ_fit.shape != (h, N, d):
-            raise ValueError(f"Expected ψ_ix shape {(h, N, d)}, got {ψ_fit.shape}.")
-        if R_ix.shape != (h, N, d):
-            raise ValueError(f"Expected W shape {(h, N, d)}, got {R_ix.shape}.")
+        β_fit = np.asarray(eager["beta_heads"], dtype=np.float32)               # (h,)
+        q_fit = np.asarray(params_eager["cl_softmax"]["q"], dtype=np.float32)   # (h, N)
+        W_fit = np.asarray(params_eager["W"], dtype=np.float32)                 # (h, N, d)
+        λ_fit = np.asarray(eager["spectral"]["lambdas"], dtype=np.float32)      # (h, d)
+        ψ_fit = np.asarray(eager["spectral"]["psi"], dtype=np.float32)          # (h, N, d)
+
         if q_fit.shape != (h, N):
             raise ValueError(f"Expected q shape {(h, N)}, got {q_fit.shape}.")
+        if W_fit.shape != (h, N, d):
+            raise ValueError(f"Expected W shape {(h, N, d)}, got {W_fit.shape}.")
+        if λ_fit.shape != (h, d):
+            raise ValueError(f"Expected lambdas shape {(h, d)}, got {λ_fit.shape}.")
+        if ψ_fit.shape != (h, N, d):
+            raise ValueError(f"Expected psi shape {(h, N, d)}, got {ψ_fit.shape}.")
 
-        # abstract dmap uses final Linear = R_ix / λ_x
-        λ_safe = np.maximum(λ_fit, float(ϵ))
-        W_linear = R_ix / λ_safe[:, None, :]  # (h, N, d)
+        L_fit = None
+        metric_rank_fit = None
+        if "L" in params_eager["SMD"]:
+            L_fit = np.asarray(params_eager["SMD"]["L"], dtype=np.float32)
+            metric_rank_fit = int(L_fit.shape[-1])
 
         self.init_data = DMAPInit(
-            R_iX=R_iX,
+            R_iX=np.asarray(params_eager["SMD"]["R_iX"], dtype=np.float32),
             β=β_fit,
             q=q_fit,
+            W=W_fit,
             λ_x=λ_fit,
             ψ_ix=ψ_fit,
-            R_ix=R_ix,
-            W_linear=W_linear,
-            ε_kernel=ε_kernel,
-            L=L,
+            L=L_fit,
         )
 
-        # build abstract flax module
         beta_module: BetaSpec
         if h == 1:
             beta_module = float(β_fit[0])
@@ -157,30 +165,29 @@ class DMAP:
             beta_module = tuple(float(b) for b in β_fit)
 
         self.module = dmap(
-            d=d,
-            N=N,
-            h=h,
+            d=int(d),
+            N=int(N),
+            h=int(h),
             α=float(α),
             β=beta_module,
-            metric_rank=metric_rank,
-            eps=float(ϵ),
+            metric_rank=metric_rank_fit,
+            eps=float(eps),
             dtype=dtype,
             param_dtype=param_dtype,
         )
 
-        # initialize flax variables
         dummy_x = jnp.zeros((1, D), dtype=dtype)
         variables = self.module.init(jax.random.PRNGKey(seed), dummy_x)
         vars_mut = unfreeze(variables)
         params = vars_mut["params"]
 
-        # patch eager solution into parameter tree
-        params["rbf"]["R_iX"] = jnp.asarray(R_iX, dtype=param_dtype)
-        params["norm"]["q"] = jnp.asarray(q_fit, dtype=param_dtype)
-        params["W"] = jnp.asarray(W_linear, dtype=param_dtype)
+        # Patch dense eager solution into abstract Flax encoder
+        params["rbf"]["R_iX"] = jnp.asarray(self.init_data.R_iX, dtype=param_dtype)
+        params["norm"]["q"] = jnp.asarray(self.init_data.q, dtype=param_dtype)
+        params["W"] = jnp.asarray(self.init_data.W, dtype=param_dtype)
 
-        if L is not None:
-            params["rbf"]["L"] = jnp.asarray(L, dtype=param_dtype)
+        if self.init_data.L is not None:
+            params["rbf"]["L"] = jnp.asarray(self.init_data.L, dtype=param_dtype)
 
         self.variables = freeze(vars_mut)
 
@@ -190,12 +197,15 @@ class DMAP:
             "h": int(h),
             "α": float(α),
             "β": beta_module,
-            "metric_rank": metric_rank,
             "t": int(t),
-            "k_nn": int(k_nn),
-            "q_block": int(q_block),
-            "r_block": int(r_block),
-            "ϵ": float(ϵ),
+            "mahalanobis": bool(mahalanobis),
+            "metric_rank": metric_rank_fit,
+            "metric_init": str(metric_init),
+            "metric_mix": float(metric_mix),
+            "zero_diag": bool(zero_diag),
+            "k_eigs": None if k_eigs is None else int(k_eigs),
+            "which": str(which),
+            "eps": float(eps),
             "seed": int(seed),
         }
 
@@ -203,11 +213,26 @@ class DMAP:
         x = jnp.asarray(x, dtype=self.module.dtype)
         return self.module.apply(self.variables, x)
 
-    @property
-    def params(self):
-        return self.variables["params"]
-
     def apply(self, x: np.ndarray | jnp.ndarray, variables: Optional[Dict[str, Any]] = None):
         x = jnp.asarray(x, dtype=self.module.dtype)
         vars_use = self.variables if variables is None else variables
         return self.module.apply(vars_use, x)
+
+    @property
+    def params(self):
+        return self.variables["params"]
+
+    @property
+    def latent_train(self) -> np.ndarray:
+        """
+        Dense eager training coordinates R_ix = λ^t ψ are not stored explicitly here,
+        but for the current eager_dmap implementation:
+            W = ψ * λ^(t-1)
+        so when t=1, W = ψ.
+        If you need exact R_ix for general t, store it directly in eager_dmap.
+        """
+        return np.asarray(self.init_data.W)
+
+    @classmethod
+    def from_eager(cls, *args, **kwargs) -> "DMAP":
+        return cls(*args, **kwargs)
