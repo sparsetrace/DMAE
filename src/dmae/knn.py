@@ -2,6 +2,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from scipy.sparse import csr_matrix
+from functools import partial
 
 
 def _symmetrize_union_min_d2(n: int, idx: np.ndarray, d2: np.ndarray) -> csr_matrix:
@@ -46,7 +47,7 @@ def _symmetrize_union_min_d2(n: int, idx: np.ndarray, d2: np.ndarray) -> csr_mat
     return csr_matrix((dd, (rr, cc)), shape=(n, n), dtype=np.float32)
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(4,))
 def _merge_topk(best_d2, best_idx, cand_d2, cand_idx, k: int):
     d2_all = jnp.concatenate([best_d2, cand_d2], axis=1)
     idx_all = jnp.concatenate([best_idx, cand_idx], axis=1)
