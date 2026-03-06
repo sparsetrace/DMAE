@@ -124,35 +124,33 @@ def knn_jax_to_csr(
 
         def body(carry, r_start):
             best_d2, best_idx = carry
-
-            # Fixed-size slices: size is always (r_block, d)
+        
             Rb = jax.lax.dynamic_slice(Xr_dev, (r_start, 0), (r_block, d))
             rnorm_b = jax.lax.dynamic_slice(rnorm_dev, (r_start,), (r_block,))
             valid_b = jax.lax.dynamic_slice(valid_ref_dev, (r_start,), (r_block,))
-
+        
             G = Q_dev @ Rb.T
             d2_block = qnorm[:, None] + rnorm_b[None, :] - 2.0 * G
             d2_block = jnp.maximum(d2_block, 0.0)
-
+        
             # Mask padded references
             d2_block = jnp.where(valid_b[None, :], d2_block, jnp.inf)
-
+        
             # Exclude self for self-kNN
             if self_case:
-                r_ids = jnp.arange(r_start, r_start + r_block, dtype=jnp.int32)
+                r_ids = r_start + jnp.arange(r_block, dtype=jnp.int32)
                 mask_self = (q_ids_dev[:, None] == r_ids[None, :])
                 d2_block = jnp.where(mask_self, jnp.inf, d2_block)
-
+        
             neg = -d2_block
             vals, loc = jax.lax.top_k(neg, k)
             cand_d2 = -vals
             cand_idx = (r_start + loc).astype(jnp.int32)
-
-            # Convert padded indices to invalid
+        
             cand_valid = cand_idx < n_r
             cand_d2 = jnp.where(cand_valid, cand_d2, jnp.inf)
             cand_idx = jnp.where(cand_valid, cand_idx, -1)
-
+        
             best_d2, best_idx = _merge_topk(best_d2, best_idx, cand_d2, cand_idx, k)
             return (best_d2, best_idx), None
 
