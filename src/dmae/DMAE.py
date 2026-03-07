@@ -199,12 +199,42 @@ class DMAE:
         Z = self.encode(X)
         return self.decode(Z)
 
-    def __call__(self, Z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, X_or_Z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
         """
-        By design, __call__ performs decoding:
-            DMAE(R_iX). __call__(R_ix) -> ambient reconstruction
+        Dispatch automatically based on the last dimension.
+    
+        Rules:
+          - if last dim == ambient D: encode
+          - else if last dim == latent d: decode
+          - if both happen to be equal, prefer encode
+    
+        Accepted ambient input:
+          - (B, D)
+    
+        Accepted latent input:
+          - (B, d)      only when h == 1
+          - (B, h, d)
         """
-        return self.decode(Z)
+        arr = jnp.asarray(X_or_Z)
+    
+        if arr.ndim < 2:
+            raise ValueError(
+                f"DMAE input must have at least 2 dims, got shape {arr.shape}."
+            )
+    
+        last_dim = int(arr.shape[-1])
+    
+        # Prefer encode on ambiguity
+        if last_dim == self.D:
+            return self.encode(arr)
+    
+        if last_dim == self.config["d"]:
+            return self.decode(arr)
+    
+        raise ValueError(
+            f"Could not infer whether input is ambient or latent from shape {arr.shape}. "
+            f"Expected last dim {self.D} (ambient) or {self.config['d']} (latent)."
+        )
 
     @property
     def params(self) -> Dict[str, Any]:
