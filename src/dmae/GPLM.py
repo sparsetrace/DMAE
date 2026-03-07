@@ -371,3 +371,96 @@ class GPLM:
     @classmethod
     def from_latents(cls, *args, **kwargs) -> "GPLM":
         return cls(*args, **kwargs)
+
+    def factorize(self, rank: int) -> Dict[str, np.ndarray]:
+        """
+        Compute an exact algebraic low-rank factorization of the solved GPLM weights.
+    
+        For each head h, factorize:
+            S_h ≈ U_h V_h
+        where:
+            S_h = self.init_data.W[h]    # shape (N, D)
+    
+        using truncated SVD:
+            S_h ≈ U0_h[:, :m] diag(s_h[:m]) V0_h[:m, :]
+    
+        We absorb singular values symmetrically:
+            U_h = U0_h[:, :m] * sqrt(s_h[:m])
+            V_h = sqrt(s_h[:m])[:, None] * V0_h[:m, :]
+    
+        so that:
+            U_h @ V_h ≈ S_h
+    
+        Parameters
+        ----------
+        rank:
+            Target factor rank m. Must satisfy 1 <= rank <= min(N, D).
+    
+        Returns
+        -------
+        dict with keys:
+            "U":      (h, N, m)
+            "V":      (h, m, D)
+            "S_hat":  (h, N, D)
+            "rel_frob_error_per_head": (h,)
+            "rel_frob_error": scalar float
+            "rank":   int
+    
+        Notes
+        -----
+        This does NOT modify the Flax model. It only factorizes the exact solved
+        decoder weights stored in self.init_data.W. If you later want inference to
+        use the low-rank form, build a separate low-rank GPLM module or a method
+        that patches/rebuilds the decoder.
+        """
+        S = np.asarray(self.init_data.W, dtype=np.float64)   # (h, N, D)
+        h, N, D = S.shape
+    
+        max_rank = min(N, D)
+        if rank <= 0 or rank > max_rank:
+            raise ValueError(
+                f"rank must be in [1, min(N,D)] = [1, {max_rank}], got rank={rank}."
+            )
+    
+        U_factors = np.zeros((h, N, rank), dtype=np.float32)
+        V_factors = np.zeros((h, rank, D), dtype=np.float32)
+        S_hat = np.zeros((h, N, D), dtype=np.float32)
+        rel_errs = np.zeros((h,), dtype=np.float32)
+    
+        for hh in range(h):
+            Sh = S[hh]  # (N, D)
+    
+            U0, s, Vt = np.linalg.svd(Sh, full_matrices=False)
+    
+            U0_r = U0[:, :rank]                      # (N, rank)
+            s_r = s[:rank]                           # (rank,)
+            Vt_r = Vt[:rank, :]                      # (rank, D)
+    
+            sqrt_s = np.sqrt(np.maximum(s_r, 0.0))   # (rank,)
+    
+            Uh = U0_r * sqrt_s[None, :]              # (N, rank)
+            Vh = sqrt_s[:, None] * Vt_r              # (rank, D)
+    
+            Sh_hat = Uh @ Vh
+    
+            denom = np.linalg.norm(Sh, ord="fro")
+            err = np.linalg.norm(Sh - Sh_hat, ord="fro")
+            rel = 0.0 if denom == 0.0 else (err / denom)
+    
+            U_factors[hh] = Uh.astype(np.float32)
+            V_factors[hh] = Vh.astype(np.float32)
+            S_hat[hh] = Sh_hat.astype(np.float32)
+            rel_errs[hh] = np.float32(rel)
+    
+        result = {
+            "U": U_factors,                                  # (h, N, rank)
+            "V": V_factors,                                  # (h, rank, D)
+            "S_hat": S_hat,                                  # (h, N, D)
+            "rel_frob_error_per_head": rel_errs,             # (h,)
+            "rel_frob_error": float(np.mean(rel_errs)),      # scalar
+            "rank": int(rank),
+        }
+    
+        # Optional convenience cache on the Python wrapper
+        self.factorization = result
+        return result
