@@ -48,9 +48,43 @@ def _pairwise_dist2(X: np.ndarray) -> np.ndarray:
     return np.maximum(d2, 0.0)
 
 
+def _normalize_latents_for_solver(R_ix: np.ndarray, N_expected: int) -> np.ndarray:
+    """
+    Normalize external latent shapes to internal solver shape (h, N, d).
+
+    Accepted:
+      - (N, d)      -> only valid for h=1, becomes (1, N, d)
+      - (N, h, d)   -> becomes (h, N, d)
+
+    Rejected:
+      - any other shape
+    """
+    R_ix = np.asarray(R_ix, dtype=np.float32)
+
+    if R_ix.ndim == 2:
+        # (N, d) -> (1, N, d)
+        if R_ix.shape[0] != N_expected:
+            raise ValueError(
+                f"R_ix shape (N,d) must have N={N_expected} on axis 0, got {R_ix.shape}."
+            )
+        return R_ix[None, ...]
+
+    if R_ix.ndim == 3:
+        # (N, h, d) -> (h, N, d)
+        if R_ix.shape[0] != N_expected:
+            raise ValueError(
+                f"R_ix shape (N,h,d) must have N={N_expected} on axis 0, got {R_ix.shape}."
+            )
+        return np.transpose(R_ix, (1, 0, 2))
+
+    raise ValueError(
+        f"R_ix must have shape (N,d) or (N,h,d), got {R_ix.shape}."
+    )
+
+
 def _solve_gplm_exact(
-    R_ix: np.ndarray,          # (h,N,d) or (N,d)
-    R_iX: np.ndarray,          # (N,D)
+    R_ix_hNd: np.ndarray,     # (h, N, d)
+    R_iX: np.ndarray,         # (N, D)
     *,
     β: float | Tuple[float, ...] | np.ndarray | None = None,
     metric_rank: int | None = None,
@@ -83,20 +117,18 @@ def _solve_gplm_exact(
         raise ValueError(f"R_iX must have shape (N, D), got {R_iX.shape}.")
     N, D = R_iX.shape
 
-    R_ix = np.asarray(R_ix, dtype=np.float64)
-    if R_ix.ndim == 2:
-        R_ix = R_ix[None, ...]
-    if R_ix.ndim != 3:
-        raise ValueError(f"R_ix must have shape (N,d) or (h,N,d), got {R_ix.shape}.")
+    R_ix_hNd = np.asarray(R_ix_hNd, dtype=np.float64)
+    if R_ix_hNd.ndim != 3:
+        raise ValueError(f"R_ix_hNd must have shape (h,N,d), got {R_ix_hNd.shape}.")
 
-    h, N2, d = R_ix.shape
+    h, N2, d = R_ix_hNd.shape
     if N2 != N:
         raise ValueError(f"R_ix and R_iX must have same N, got {N2} and {N}.")
 
     if β is None:
         beta_heads = np.zeros((h,), dtype=np.float64)
         for hh in range(h):
-            d2 = _pairwise_dist2(R_ix[hh])
+            d2 = _pairwise_dist2(R_ix_hNd[hh])
             off = d2[~np.eye(N, dtype=bool)]
             med = np.median(off) if off.size else 1.0
             beta_heads[hh] = 1.0 / (med + eps)
@@ -109,7 +141,6 @@ def _solve_gplm_exact(
 
     W_heads = np.zeros((h, N, D), dtype=np.float64)
 
-    # Optional Mahalanobis in latent space
     L = None
     if metric_rank is not None:
         r = int(metric_rank)
@@ -119,7 +150,7 @@ def _solve_gplm_exact(
         L = np.broadcast_to(I[None, :, :], (h, d, r)).copy()
 
     for hh in range(h):
-        Z = R_ix[hh]  # (N,d)
+        Z = R_ix_hNd[hh]  # (N,d)
         if L is None:
             Zp = Z
         else:
@@ -134,7 +165,7 @@ def _solve_gplm_exact(
         W_heads[hh] = S
 
     params = {
-        "R_ix": R_ix.astype(np.float32),
+        "R_ix": R_ix_hNd.astype(np.float32),
         "W": W_heads.astype(np.float32),
     }
     if L is not None:
@@ -148,7 +179,7 @@ def _solve_gplm_exact(
 
 @dataclass
 class GPLMInit:
-    R_ix: np.ndarray                  # (h,N,d)
+    R_ix_hNd: np.ndarray              # (h,N,d) internal
     R_iX: np.ndarray                  # (N,D)
     β: np.ndarray                     # (h,)
     W: np.ndarray                     # (h,N,D)
@@ -161,18 +192,22 @@ class GPLM:
     """
     Exact dense GPLM decoder wrapper around the abstract Flax `gplm` block.
 
-    Given latent anchors R_ix and ambient targets R_iX, solves per head:
-        S_h = (K_h + sigma2 I)^(-1) R_iX
-    and uses S_h as the decoder linear map after the latent RBF kernel.
+    External latent convention:
+      - single-head: R_ix may be (N,d)
+      - multi-head:  R_ix must be (N,h,d)
 
-    By default, head outputs are concatenated.
-    If use_W_O=True, a final learned output projection is added.
+    Inference accepts:
+      - single-head: z may be (B,d)
+      - multi-head:  z must be (B,h,d)
+
+    Internally, latents are converted to (h,N,d) for the exact solve and
+    the Flax parameter tree.
     """
 
     def __init__(
         self,
-        R_ix: np.ndarray,
-        R_iX: np.ndarray,
+        R_ix: np.ndarray,   # external: (N,d) for h=1 or (N,h,d)
+        R_iX: np.ndarray,   # (N,D)
         *,
         β: float | Tuple[float, ...] | np.ndarray | None = None,
         beta: float | Tuple[float, ...] | np.ndarray | None = None,
@@ -192,18 +227,14 @@ class GPLM:
             raise ValueError(f"R_iX must have shape (N, D), got {R_iX.shape}.")
         N, D = R_iX.shape
 
-        R_ix = np.asarray(R_ix, dtype=np.float32)
-        if R_ix.ndim == 2:
-            R_ix = R_ix[None, ...]
-        if R_ix.ndim != 3:
-            raise ValueError(f"R_ix must have shape (N,d) or (h,N,d), got {R_ix.shape}.")
-
-        h, N2, d = R_ix.shape
+        # Normalize external latent convention to internal (h,N,d)
+        R_ix_hNd = _normalize_latents_for_solver(R_ix, N_expected=N)
+        h, N2, d = R_ix_hNd.shape
         if N2 != N:
             raise ValueError(f"R_ix and R_iX must have same N, got {N2} and {N}.")
 
         eager = _solve_gplm_exact(
-            R_ix=R_ix,
+            R_ix_hNd=R_ix_hNd,
             R_iX=R_iX,
             β=β,
             metric_rank=metric_rank,
@@ -236,7 +267,7 @@ class GPLM:
             D_out_final = h * D
 
         self.init_data = GPLMInit(
-            R_ix=R_ix_fit,
+            R_ix_hNd=R_ix_fit,
             R_iX=R_iX,
             β=beta_heads,
             W=W_fit,
@@ -269,7 +300,7 @@ class GPLM:
         vars_mut = unfreeze(variables)
         params = vars_mut["params"]
 
-        params["R_ix"] = jnp.asarray(self.init_data.R_ix, dtype=param_dtype)
+        params["R_ix"] = jnp.asarray(self.init_data.R_ix_hNd, dtype=param_dtype)
         params["W"] = jnp.asarray(self.init_data.W, dtype=param_dtype)
 
         if self.init_data.L is not None:
@@ -282,7 +313,7 @@ class GPLM:
         self.variables = freeze(vars_mut)
 
         self.config = {
-            "R_ix_shape": tuple(R_ix.shape),
+            "R_ix_external_shape": tuple(np.asarray(R_ix).shape),
             "R_iX_shape": tuple(R_iX.shape),
             "h": int(h),
             "d": int(d),
@@ -296,24 +327,40 @@ class GPLM:
             "seed": int(seed),
         }
 
-    def __call__(self, z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+    def _normalize_inference_latents(self, z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+        """
+        External inference convention:
+          - if h=1: accept (B,d) or (B,1,d)
+          - if h>1: accept only (B,h,d)
+        """
         z = jnp.asarray(z, dtype=self.module.dtype)
+        h = self.config["h"]
+
         if z.ndim == 2:
-            if self.config["h"] != 1:
+            if h != 1:
                 raise ValueError(
-                    f"Got 2D latent input {z.shape}, but decoder has h={self.config['h']} heads."
+                    f"Got latent input shape {z.shape}; for h={h}, expected (B,h,d)."
                 )
-            z = z[:, None, :]
+            z = z[:, None, :]  # (B,1,d)
+            return z
+
+        if z.ndim == 3:
+            if z.shape[1] != h:
+                raise ValueError(
+                    f"Expected latent input shape (B,h,d) with h={h}, got {z.shape}."
+                )
+            return z
+
+        raise ValueError(
+            f"Latent input must have shape (B,d) (only for h=1) or (B,h,d), got {z.shape}."
+        )
+
+    def __call__(self, z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+        z = self._normalize_inference_latents(z)
         return self.module.apply(self.variables, z)
 
     def apply(self, z: np.ndarray | jnp.ndarray, variables: Optional[Dict[str, Any]] = None):
-        z = jnp.asarray(z, dtype=self.module.dtype)
-        if z.ndim == 2:
-            if self.config["h"] != 1:
-                raise ValueError(
-                    f"Got 2D latent input {z.shape}, but decoder has h={self.config['h']} heads."
-                )
-            z = z[:, None, :]
+        z = self._normalize_inference_latents(z)
         vars_use = self.variables if variables is None else variables
         return self.module.apply(vars_use, z)
 
