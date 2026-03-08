@@ -7,8 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
+import jax
 import jax.numpy as jnp
+from flax.core import freeze, unfreeze
 
+from .blocks import gplm
 from .hf_io import (
     write_json,
     read_json,
@@ -24,15 +27,15 @@ from .hf_io import (
 BetaSpec = Union[float, Tuple[float, ...]]
 
 
-def _resolve_beta_alias(beta_greek, beta_ascii, default=None):
-    if beta_greek is not None and beta_ascii is not None:
-        a = np.asarray(beta_greek if not np.isscalar(beta_greek) else [beta_greek], dtype=np.float64)
-        b = np.asarray(beta_ascii if not np.isscalar(beta_ascii) else [beta_ascii], dtype=np.float64)
+def _resolve_beta_alias(β, beta, default=None):
+    if β is not None and beta is not None:
+        a = np.asarray(β if not np.isscalar(β) else [β], dtype=np.float64)
+        b = np.asarray(beta if not np.isscalar(beta) else [beta], dtype=np.float64)
         if a.shape != b.shape or not np.allclose(a, b):
             raise ValueError("Got both β and beta with different values; provide only one.")
-    if beta_greek is None and beta_ascii is None:
+    if β is None and beta is None:
         return default
-    return beta_ascii if beta_greek is None else beta_greek
+    return beta if β is None else β
 
 
 def _pairwise_dist2(X: np.ndarray) -> np.ndarray:
@@ -49,7 +52,7 @@ def _normalize_latents_for_solver(R_ix: np.ndarray, N_expected: int) -> np.ndarr
       - (N, d)      -> only valid for h=1, becomes (1, N, d)
       - (N, h, d)   -> becomes (h, N, d)
     """
-    R_ix = np.asarray(R_ix)
+    R_ix = np.asarray(R_ix, dtype=np.float32)
 
     if R_ix.ndim == 2:
         if R_ix.shape[0] != N_expected:
@@ -68,259 +71,25 @@ def _normalize_latents_for_solver(R_ix: np.ndarray, N_expected: int) -> np.ndarr
     raise ValueError(f"R_ix must have shape (N,d) or (N,h,d), got {R_ix.shape}.")
 
 
-def _make_identity_metric(h: int, d: int, metric_rank: Optional[int]) -> Optional[np.ndarray]:
-    if metric_rank is None:
-        return None
-    r = int(metric_rank)
-    if r <= 0 or r > d:
-        raise ValueError(f"metric_rank must be in [1,d], got r={r}, d={d}.")
-    I = np.eye(d, dtype=np.float64)[:, :r]
-    return np.broadcast_to(I[None, :, :], (h, d, r)).copy()
-
-
-def _apply_metric(Z: np.ndarray, L: Optional[np.ndarray]) -> np.ndarray:
-    if L is None:
-        return Z
-    return Z @ L
-
-
-def _prepare_beta_heads(
-    R_ix_hNd: np.ndarray,
-    beta: float | Tuple[float, ...] | np.ndarray | None,
-    eps: float,
-) -> np.ndarray:
-    h, N, _ = R_ix_hNd.shape
-    if beta is None:
-        beta_heads = np.zeros((h,), dtype=np.float64)
-        for hh in range(h):
-            d2 = _pairwise_dist2(R_ix_hNd[hh])
-            off = d2[~np.eye(N, dtype=bool)]
-            med = np.median(off) if off.size else 1.0
-            beta_heads[hh] = 1.0 / (med + eps)
-        return beta_heads
-
-    if np.isscalar(beta):
-        return np.full((h,), float(beta), dtype=np.float64)
-
-    beta_heads = np.asarray(beta, dtype=np.float64).reshape(-1)
-    if beta_heads.shape[0] != h:
-        raise ValueError(f"β must be scalar or length h={h}, got shape {beta_heads.shape}.")
-    return beta_heads
-
-
-class _KernelLinearOperator:
-    """
-    Matrix-free operator for A = K + sigma2 * I, where K is the latent RBF kernel.
-
-    This class never materializes K. A matrix-vector or matrix-matrix product is
-    computed in row blocks using the identity
-
-        K_ij = exp(-beta * ||z_i - z_j||^2).
-
-    Complexity per call:
-      - compute: O(N^2 * (r + m)) for an input with m right-hand sides and metric rank r
-      - peak memory: O(block_size * N + N * m)
-
-    The important point is that memory is sub-quadratic; we do not store the full N x N kernel.
-    """
-
-    def __init__(self, Z_train: np.ndarray, beta: float, sigma2: float, block_size: int = 1024):
-        Z_train = np.asarray(Z_train, dtype=np.float64)
-        if Z_train.ndim != 2:
-            raise ValueError(f"Z_train must have shape (N,r), got {Z_train.shape}.")
-        self.Z_train = Z_train
-        self.beta = float(beta)
-        self.sigma2 = float(sigma2)
-        self.block_size = int(block_size)
-        self.N = int(Z_train.shape[0])
-        self.z2 = np.sum(Z_train * Z_train, axis=1, dtype=np.float64)
-
-    def kernel_mm(self, V: np.ndarray) -> np.ndarray:
-        """Return K @ V without materializing K."""
-        V = np.asarray(V, dtype=np.float64)
-        was_vector = (V.ndim == 1)
-        if was_vector:
-            V = V[:, None]
-        if V.ndim != 2 or V.shape[0] != self.N:
-            raise ValueError(f"V must have shape (N,) or (N,m), got {V.shape} with N={self.N}.")
-
-        m = V.shape[1]
-        out = np.empty((self.N, m), dtype=np.float64)
-        Z = self.Z_train
-        z2 = self.z2
-        for start in range(0, self.N, self.block_size):
-            stop = min(start + self.block_size, self.N)
-            Zb = Z[start:stop]                    # (B,r)
-            d2 = z2[start:stop, None] + z2[None, :] - 2.0 * (Zb @ Z.T)
-            np.maximum(d2, 0.0, out=d2)
-            K_block = np.exp(-self.beta * d2)
-            out[start:stop] = K_block @ V
-        return out[:, 0] if was_vector else out
-
-    def mv(self, V: np.ndarray) -> np.ndarray:
-        return self.kernel_mm(V) + self.sigma2 * np.asarray(V, dtype=np.float64)
-
-    def cross_kernel_mm(self, Z_query: np.ndarray, V: np.ndarray) -> np.ndarray:
-        """Return K(Z_query, Z_train) @ V without materializing the cross-kernel."""
-        Z_query = np.asarray(Z_query, dtype=np.float64)
-        V = np.asarray(V, dtype=np.float64)
-        if Z_query.ndim != 2:
-            raise ValueError(f"Z_query must have shape (A,r), got {Z_query.shape}.")
-        if V.ndim != 2 or V.shape[0] != self.N:
-            raise ValueError(f"V must have shape (N,m), got {V.shape} with N={self.N}.")
-
-        A = Z_query.shape[0]
-        m = V.shape[1]
-        out = np.empty((A, m), dtype=np.float64)
-        q2 = np.sum(Z_query * Z_query, axis=1, dtype=np.float64)
-        Z = self.Z_train
-        z2 = self.z2
-        for start in range(0, A, self.block_size):
-            stop = min(start + self.block_size, A)
-            Zb = Z_query[start:stop]
-            d2 = q2[start:stop, None] + z2[None, :] - 2.0 * (Zb @ Z.T)
-            np.maximum(d2, 0.0, out=d2)
-            K_block = np.exp(-self.beta * d2)
-            out[start:stop] = K_block @ V
-        return out
-
-
-@dataclass
-class _CGInfo:
-    converged: bool
-    iters: int
-    rel_residual: float
-    abs_residual: float
-
-
-@dataclass
-class GPLMInit:
-    R_ix_hNd: np.ndarray              # (h,N,d)
-    R_iX: np.ndarray                  # (N,D)
-    beta_heads: np.ndarray            # (h,)
-    W: np.ndarray                     # (h,N,D)
-    L: Optional[np.ndarray] = None    # (h,d,r)
-    W_O: Optional[np.ndarray] = None  # (h*D, D_out)
-    b_O: Optional[np.ndarray] = None  # (D_out,)
-    cg_info: Optional[Dict[str, Any]] = None
-
-
-def _pcg_matrix(
-    A_mv,
-    B: np.ndarray,
+def _solve_gplm_exact(
+    R_ix_hNd: np.ndarray,     # (h, N, d)
+    R_iX: np.ndarray,         # (N, D)
     *,
-    M_inv_mv=None,
-    x0: Optional[np.ndarray] = None,
-    tol: float = 1e-6,
-    atol: float = 0.0,
-    maxiter: Optional[int] = None,
-    eps: float = 1e-30,
-) -> tuple[np.ndarray, _CGInfo]:
-    """
-    Conjugate gradient on the vectorized system with multiple right-hand sides.
-
-    We treat B in R^(N x D) as one long vector under the Frobenius inner product.
-    That is mathematically equivalent to solving (I_D ⊗ A) vec(X) = vec(B) with CG.
-
-    Notes:
-      - A must be SPD.
-      - This avoids explicit K^{-1}; it solves A X = B directly.
-      - For fixed D, each iteration costs one matrix-free kernel matmul, i.e. O(N^2).
-        More precisely the arithmetic is O(N^2 * D) for the kernel-times-matrix part.
-    """
-    B = np.asarray(B, dtype=np.float64)
-    if B.ndim == 1:
-        B = B[:, None]
-    if B.ndim != 2:
-        raise ValueError(f"B must have shape (N,) or (N,m), got {B.shape}.")
-
-    X = np.zeros_like(B) if x0 is None else np.asarray(x0, dtype=np.float64).copy()
-    if X.shape != B.shape:
-        raise ValueError(f"x0 must match B shape {B.shape}, got {X.shape}.")
-
-    if M_inv_mv is None:
-        def M_inv_mv(R):
-            return R
-
-    R = B - A_mv(X)
-    Z = M_inv_mv(R)
-    P = Z.copy()
-
-    b_norm = float(np.linalg.norm(B))
-    rz_old = float(np.sum(R * Z))
-    r_norm = float(np.linalg.norm(R))
-    threshold = max(float(atol), float(tol) * max(b_norm, eps))
-
-    if maxiter is None:
-        maxiter = 5 * B.shape[0]
-
-    if r_norm <= threshold:
-        info = _CGInfo(converged=True, iters=0, rel_residual=0.0 if b_norm == 0 else r_norm / b_norm, abs_residual=r_norm)
-        return X, info
-
-    converged = False
-    iters = 0
-
-    for k in range(1, int(maxiter) + 1):
-        AP = A_mv(P)
-        denom = float(np.sum(P * AP))
-        if abs(denom) <= eps:
-            break
-
-        alpha = rz_old / denom
-        X = X + alpha * P
-        R = R - alpha * AP
-        r_norm = float(np.linalg.norm(R))
-        iters = k
-
-        if r_norm <= threshold:
-            converged = True
-            break
-
-        Z = M_inv_mv(R)
-        rz_new = float(np.sum(R * Z))
-        beta = rz_new / max(rz_old, eps)
-        P = Z + beta * P
-        rz_old = rz_new
-
-    rel = 0.0 if b_norm == 0.0 else (r_norm / b_norm)
-    info = _CGInfo(converged=converged, iters=iters, rel_residual=rel, abs_residual=r_norm)
-    return X, info
-
-
-def _solve_gplm_cg(
-    R_ix_hNd: np.ndarray,
-    R_iX: np.ndarray,
-    *,
-    beta: float | Tuple[float, ...] | np.ndarray | None = None,
+    β: float | Tuple[float, ...] | np.ndarray | None = None,
     metric_rank: int | None = None,
     sigma2: float = 1e-6,
-    cg_tol: float = 1e-6,
-    cg_atol: float = 0.0,
-    cg_maxiter: Optional[int] = None,
-    block_size: int = 1024,
-    warm_start: Optional[np.ndarray] = None,
     eps: float = 1e-12,
+    seed: int = 0,
 ) -> dict:
     """
-    Solve for decoder weights W in
+    Exact dense GPLM solve per head.
 
-        (K_h + sigma2 I) W_h = R_iX,
-
-    one head at a time, using matrix-free conjugate gradients.
-
-    This is the CG replacement for the dense exact solve
-
-        W_h = (K_h + sigma2 I)^{-1} R_iX,
-
-    used in the original implementation.
-
-    Complexity:
-      - compute: O(h * T * N^2 * D_head) for T CG iterations and fixed latent rank
-      - memory:  O(h * N * D_head + h * N * d + block_size * N)
-
-    The memory stays sub-quadratic because K is never formed explicitly.
+    For each head h:
+        K_h[i,j] = exp(-β_h * d_h^2(R_ix[i], R_ix[j]))
+        S_h      = (K_h + sigma2 I)^(-1) R_iX
     """
+    _ = np.random.default_rng(seed)
+
     R_iX = np.asarray(R_iX, dtype=np.float64)
     if R_iX.ndim != 2:
         raise ValueError(f"R_iX must have shape (N, D), got {R_iX.shape}.")
@@ -334,44 +103,39 @@ def _solve_gplm_cg(
     if N2 != N:
         raise ValueError(f"R_ix and R_iX must have same N, got {N2} and {N}.")
 
-    beta_heads = _prepare_beta_heads(R_ix_hNd=R_ix_hNd, beta=beta, eps=eps)
-    L = _make_identity_metric(h=h, d=d, metric_rank=metric_rank)
+    if β is None:
+        beta_heads = np.zeros((h,), dtype=np.float64)
+        for hh in range(h):
+            d2 = _pairwise_dist2(R_ix_hNd[hh])
+            off = d2[~np.eye(N, dtype=bool)]
+            med = np.median(off) if off.size else 1.0
+            beta_heads[hh] = 1.0 / (med + eps)
+    elif np.isscalar(β):
+        beta_heads = np.full((h,), float(β), dtype=np.float64)
+    else:
+        beta_heads = np.asarray(β, dtype=np.float64).reshape(-1)
+        if beta_heads.shape[0] != h:
+            raise ValueError(f"β must be scalar or length h={h}, got shape {beta_heads.shape}.")
 
     W_heads = np.zeros((h, N, D), dtype=np.float64)
-    info_per_head = []
 
-    if warm_start is not None:
-        warm_start = np.asarray(warm_start, dtype=np.float64)
-        if warm_start.shape != (h, N, D):
-            raise ValueError(
-                f"warm_start must have shape {(h, N, D)}, got {warm_start.shape}."
-            )
+    L = None
+    if metric_rank is not None:
+        r = int(metric_rank)
+        if r <= 0 or r > d:
+            raise ValueError(f"metric_rank must be in [1,d], got r={r}, d={d}.")
+        I = np.eye(d, dtype=np.float64)[:, :r]
+        L = np.broadcast_to(I[None, :, :], (h, d, r)).copy()
 
     for hh in range(h):
-        Z = _apply_metric(R_ix_hNd[hh], None if L is None else L[hh])
-        op = _KernelLinearOperator(
-            Z_train=Z,
-            beta=float(beta_heads[hh]),
-            sigma2=float(sigma2),
-            block_size=int(block_size),
-        )
-        x0 = None if warm_start is None else warm_start[hh]
-        W_h, cg_info = _pcg_matrix(
-            op.mv,
-            R_iX,
-            M_inv_mv=None,   # identity preconditioner; no inducing points / landmarks
-            x0=x0,
-            tol=float(cg_tol),
-            atol=float(cg_atol),
-            maxiter=cg_maxiter,
-        )
-        W_heads[hh] = W_h
-        info_per_head.append({
-            "converged": bool(cg_info.converged),
-            "iters": int(cg_info.iters),
-            "rel_residual": float(cg_info.rel_residual),
-            "abs_residual": float(cg_info.abs_residual),
-        })
+        Z = R_ix_hNd[hh]
+        Zp = Z if L is None else (Z @ L[hh])
+
+        d2 = _pairwise_dist2(Zp)
+        K = np.exp(-beta_heads[hh] * d2)
+        A = K + float(sigma2) * np.eye(N, dtype=np.float64)
+        S = np.linalg.solve(A, R_iX)  # (N,D)
+        W_heads[hh] = S
 
     params = {
         "R_ix": R_ix_hNd.astype(np.float32),
@@ -383,13 +147,23 @@ def _solve_gplm_cg(
     return {
         "params": params,
         "beta_heads": beta_heads.astype(np.float32),
-        "cg_info": info_per_head,
     }
+
+
+@dataclass
+class GPLMInit:
+    R_ix_hNd: np.ndarray              # (h,N,d)
+    R_iX: np.ndarray                  # (N,D)
+    β: np.ndarray                     # (h,)
+    W: np.ndarray                     # (h,N,D)
+    L: Optional[np.ndarray] = None    # (h,d,r)
+    W_O: Optional[np.ndarray] = None  # (h*D, D_out)
+    b_O: Optional[np.ndarray] = None  # (D_out,)
 
 
 class GPLM:
     """
-    Matrix-free RBF GPLM decoder solved with conjugate gradients.
+    Exact dense GPLM decoder wrapper around the abstract Flax `gplm` block.
 
     External latent convention:
       - single-head: R_ix may be (N,d)
@@ -399,12 +173,7 @@ class GPLM:
       - single-head: z may be (B,d)
       - multi-head:  z must be (B,h,d)
 
-    Important complexity notes:
-      - This implementation avoids explicit Cholesky and never materializes K.
-      - Solve cost is O(T * N^2 * D_head) per head, where T is the CG iteration count.
-      - Peak memory is sub-quadratic: O(N*d + N*D_head + block_size*N), not O(N^2).
-      - Test-time decoding of A query points costs O(A * N * D_head) for the final cross-kernel
-        times weights, plus the cost of evaluating the RBF distances.
+    Internally, latents are converted to (h,N,d).
     """
 
     def __init__(
@@ -418,53 +187,42 @@ class GPLM:
         sigma2: float = 1e-6,
         use_W_O: bool = False,
         D_out: int | None = None,
-        cg_tol: float = 1e-6,
-        cg_atol: float = 0.0,
-        cg_maxiter: Optional[int] = None,
-        block_size: int = 1024,
-        warm_start: Optional[np.ndarray] = None,
         eps: float = 1e-12,
         seed: int = 0,
         dtype: Any = jnp.float32,
         param_dtype: Any = jnp.float32,
     ):
-        del seed  # kept for backward-compatible signature; solver is deterministic.
         β = _resolve_beta_alias(β, beta, None)
 
-        R_iX = np.asarray(R_iX, dtype=np.float64)
+        R_iX = np.asarray(R_iX, dtype=np.float32)
         if R_iX.ndim != 2:
             raise ValueError(f"R_iX must have shape (N, D), got {R_iX.shape}.")
         N, D = R_iX.shape
 
-        R_ix_hNd = _normalize_latents_for_solver(R_ix, N_expected=N).astype(np.float64)
+        R_ix_hNd = _normalize_latents_for_solver(R_ix, N_expected=N)
         h, N2, d = R_ix_hNd.shape
         if N2 != N:
             raise ValueError(f"R_ix and R_iX must have same N, got {N2} and {N}.")
 
-        solved = _solve_gplm_cg(
+        eager = _solve_gplm_exact(
             R_ix_hNd=R_ix_hNd,
             R_iX=R_iX,
-            beta=β,
+            β=β,
             metric_rank=metric_rank,
             sigma2=float(sigma2),
-            cg_tol=float(cg_tol),
-            cg_atol=float(cg_atol),
-            cg_maxiter=cg_maxiter,
-            block_size=int(block_size),
-            warm_start=warm_start,
             eps=float(eps),
+            seed=int(seed),
         )
 
-        params_solved = solved["params"]
-        beta_heads = np.asarray(solved["beta_heads"], dtype=np.float32)
-        R_ix_fit = np.asarray(params_solved["R_ix"], dtype=np.float32)
-        W_fit = np.asarray(params_solved["W"], dtype=np.float32)
-        cg_info = solved["cg_info"]
+        params_eager = eager["params"]
+        beta_heads = np.asarray(eager["beta_heads"], dtype=np.float32)
+        R_ix_fit = np.asarray(params_eager["R_ix"], dtype=np.float32)
+        W_fit = np.asarray(params_eager["W"], dtype=np.float32)
 
         L_fit = None
         metric_rank_fit = None
-        if "L" in params_solved:
-            L_fit = np.asarray(params_solved["L"], dtype=np.float32)
+        if "L" in params_eager:
+            L_fit = np.asarray(params_eager["L"], dtype=np.float32)
             metric_rank_fit = int(L_fit.shape[-1])
 
         W_O_init = None
@@ -481,13 +239,12 @@ class GPLM:
 
         self.init_data = GPLMInit(
             R_ix_hNd=R_ix_fit,
-            R_iX=R_iX.astype(np.float32),
-            beta_heads=beta_heads,
+            R_iX=R_iX,
+            β=beta_heads,
             W=W_fit,
             L=L_fit,
             W_O=W_O_init,
             b_O=b_O_init,
-            cg_info={"per_head": cg_info},
         )
 
         beta_module: BetaSpec
@@ -496,19 +253,35 @@ class GPLM:
         else:
             beta_module = tuple(float(b) for b in beta_heads)
 
-        self.dtype = dtype
-        self.param_dtype = param_dtype
-        self.variables = {
-            "params": {
-                "R_ix": np.asarray(self.init_data.R_ix_hNd, dtype=np.float32),
-                "W": np.asarray(self.init_data.W, dtype=np.float32),
-            }
-        }
+        self.module = gplm(
+            D_head=int(D),
+            N=int(N),
+            h=int(h),
+            β=beta_module,
+            metric_rank=metric_rank_fit,
+            use_W_O=bool(use_W_O),
+            D_out=None if not use_W_O else int(D_out_final),
+            eps=float(eps),
+            dtype=dtype,
+            param_dtype=param_dtype,
+        )
+
+        dummy_z = jnp.zeros((1, h, d), dtype=dtype)
+        variables = self.module.init(jax.random.PRNGKey(seed), dummy_z)
+        vars_mut = unfreeze(variables)
+        params = vars_mut["params"]
+
+        params["R_ix"] = jnp.asarray(self.init_data.R_ix_hNd, dtype=param_dtype)
+        params["W"] = jnp.asarray(self.init_data.W, dtype=param_dtype)
+
         if self.init_data.L is not None:
-            self.variables["params"]["L"] = np.asarray(self.init_data.L, dtype=np.float32)
+            params["L"] = jnp.asarray(self.init_data.L, dtype=param_dtype)
+
         if use_W_O:
-            self.variables["params"]["W_O"] = np.asarray(self.init_data.W_O, dtype=np.float32)
-            self.variables["params"]["b_O"] = np.asarray(self.init_data.b_O, dtype=np.float32)
+            params["W_O"] = jnp.asarray(self.init_data.W_O, dtype=param_dtype)
+            params["b_O"] = jnp.asarray(self.init_data.b_O, dtype=param_dtype)
+
+        self.variables = freeze(vars_mut)
 
         self.config = {
             "R_ix_external_shape": tuple(np.asarray(R_ix).shape),
@@ -521,21 +294,16 @@ class GPLM:
             "metric_rank": metric_rank_fit,
             "sigma2": float(sigma2),
             "use_W_O": bool(use_W_O),
-            "cg_tol": float(cg_tol),
-            "cg_atol": float(cg_atol),
-            "cg_maxiter": None if cg_maxiter is None else int(cg_maxiter),
-            "block_size": int(block_size),
             "eps": float(eps),
-            "solver": "matrix_free_cg",
-            "cg_info": cg_info,
+            "seed": int(seed),
         }
 
     # -------------------------
-    # Inference helpers
+    # Inference
     # -------------------------
 
-    def _normalize_inference_latents(self, z: np.ndarray | jnp.ndarray) -> np.ndarray:
-        z = np.asarray(z, dtype=np.float64)
+    def _normalize_inference_latents(self, z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
+        z = jnp.asarray(z, dtype=self.module.dtype)
         h = self.config["h"]
 
         if z.ndim == 2:
@@ -557,140 +325,28 @@ class GPLM:
             f"Latent input must have shape (B,d) (only for h=1) or (B,h,d), got {z.shape}."
         )
 
-    def _predict_with_params(self, z_hBd: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
-        h = self.config["h"]
-        D = self.config["D_head"]
-        block_size = self.config["block_size"]
-
-        R_ix_hNd = np.asarray(params["R_ix"], dtype=np.float64)
-        W_hND = np.asarray(params["W"], dtype=np.float64)
-        beta_cfg = self.config["β"]
-        if np.isscalar(beta_cfg):
-            beta_heads = np.full((h,), float(beta_cfg), dtype=np.float64)
-        else:
-            beta_heads = np.asarray(beta_cfg, dtype=np.float64)
-        L = None if "L" not in params else np.asarray(params["L"], dtype=np.float64)
-
-        head_outputs = []
-        for hh in range(h):
-            Z_train = _apply_metric(R_ix_hNd[hh], None if L is None else L[hh])
-            Z_query = _apply_metric(z_hBd[:, hh, :], None if L is None else L[hh])
-            op = _KernelLinearOperator(
-                Z_train=Z_train,
-                beta=float(beta_heads[hh]),
-                sigma2=float(self.config["sigma2"]),
-                block_size=int(block_size),
-            )
-            Y_h = op.cross_kernel_mm(Z_query=Z_query, V=W_hND[hh])
-            head_outputs.append(Y_h)
-
-        Y_cat = np.concatenate(head_outputs, axis=1)  # (B, h*D)
-        if self.config["use_W_O"]:
-            W_O = np.asarray(params["W_O"], dtype=np.float64)
-            b_O = np.asarray(params["b_O"], dtype=np.float64)
-            Y = Y_cat @ W_O + b_O
-        else:
-            Y = Y_cat if h > 1 else head_outputs[0]
-
-        return Y
-
-    # -------------------------
-    # Inference
-    # -------------------------
-
     def __call__(self, z: np.ndarray | jnp.ndarray) -> jnp.ndarray:
         z = self._normalize_inference_latents(z)
-        y = self._predict_with_params(z, self.variables["params"])
-        return jnp.asarray(y, dtype=self.dtype)
+        return self.module.apply(self.variables, z)
 
     def apply(self, z: np.ndarray | jnp.ndarray, variables: Optional[Dict[str, Any]] = None):
         z = self._normalize_inference_latents(z)
         vars_use = self.variables if variables is None else variables
-        if "params" not in vars_use:
-            raise ValueError("variables must be a dict containing a 'params' key.")
-        y = self._predict_with_params(z, vars_use["params"])
-        return jnp.asarray(y, dtype=self.dtype)
+        return self.module.apply(vars_use, z)
 
     @property
     def params(self):
         return self.variables["params"]
 
     # -------------------------
-    # Refit / warm-start utility
-    # -------------------------
-
-    def refit(
-        self,
-        *,
-        R_ix: Optional[np.ndarray] = None,
-        R_iX: Optional[np.ndarray] = None,
-        β: float | Tuple[float, ...] | np.ndarray | None = None,
-        beta: float | Tuple[float, ...] | np.ndarray | None = None,
-        sigma2: Optional[float] = None,
-        cg_tol: Optional[float] = None,
-        cg_atol: Optional[float] = None,
-        cg_maxiter: Optional[int] = None,
-        block_size: Optional[int] = None,
-        warm_start: bool = True,
-    ) -> None:
-        """
-        Re-solve the GPLM weights after latents or hyperparameters change.
-
-        This is the operation you should call if you fine-tune R_ix, beta, or sigma2
-        outside this class and want W to remain consistent with the kernel.
-        """
-        beta_merged = _resolve_beta_alias(β, beta, self.config["β"])
-        R_iX_use = self.init_data.R_iX if R_iX is None else np.asarray(R_iX, dtype=np.float64)
-        N = R_iX_use.shape[0]
-        R_ix_use = np.transpose(self.init_data.R_ix_hNd, (1, 0, 2)) if R_ix is None else np.asarray(R_ix)
-        R_ix_hNd = _normalize_latents_for_solver(R_ix_use, N_expected=N).astype(np.float64)
-
-        solved = _solve_gplm_cg(
-            R_ix_hNd=R_ix_hNd,
-            R_iX=R_iX_use,
-            beta=beta_merged,
-            metric_rank=self.config["metric_rank"],
-            sigma2=float(self.config["sigma2"] if sigma2 is None else sigma2),
-            cg_tol=float(self.config["cg_tol"] if cg_tol is None else cg_tol),
-            cg_atol=float(self.config["cg_atol"] if cg_atol is None else cg_atol),
-            cg_maxiter=self.config["cg_maxiter"] if cg_maxiter is None else int(cg_maxiter),
-            block_size=int(self.config["block_size"] if block_size is None else block_size),
-            warm_start=self.init_data.W.astype(np.float64) if warm_start else None,
-            eps=float(self.config["eps"]),
-        )
-
-        self.init_data.R_ix_hNd = solved["params"]["R_ix"]
-        self.init_data.R_iX = np.asarray(R_iX_use, dtype=np.float32)
-        self.init_data.beta_heads = np.asarray(solved["beta_heads"], dtype=np.float32)
-        self.init_data.W = np.asarray(solved["params"]["W"], dtype=np.float32)
-        if "L" in solved["params"]:
-            self.init_data.L = np.asarray(solved["params"]["L"], dtype=np.float32)
-        self.init_data.cg_info = {"per_head": solved["cg_info"]}
-
-        self.variables["params"]["R_ix"] = np.asarray(self.init_data.R_ix_hNd, dtype=np.float32)
-        self.variables["params"]["W"] = np.asarray(self.init_data.W, dtype=np.float32)
-        if self.init_data.L is not None:
-            self.variables["params"]["L"] = np.asarray(self.init_data.L, dtype=np.float32)
-
-        h = self.config["h"]
-        beta_heads = np.asarray(self.init_data.beta_heads, dtype=np.float32)
-        self.config["β"] = float(beta_heads[0]) if h == 1 else tuple(float(b) for b in beta_heads)
-        self.config["sigma2"] = float(self.config["sigma2"] if sigma2 is None else sigma2)
-        self.config["cg_tol"] = float(self.config["cg_tol"] if cg_tol is None else cg_tol)
-        self.config["cg_atol"] = float(self.config["cg_atol"] if cg_atol is None else cg_atol)
-        self.config["cg_maxiter"] = self.config["cg_maxiter"] if cg_maxiter is None else int(cg_maxiter)
-        self.config["block_size"] = int(self.config["block_size"] if block_size is None else block_size)
-        self.config["cg_info"] = solved["cg_info"]
-
-    # -------------------------
-    # Low-rank factorization of solved weights
+    # Low-rank factorization
     # -------------------------
 
     def factorize(self, rank: int) -> Dict[str, np.ndarray]:
         """
         Compute truncated SVD per head:
-            W_h ≈ U_h V_h
-        where W_h = self.init_data.W[h] has shape (N, D).
+            S_h ≈ U_h V_h
+        where S_h = self.init_data.W[h] has shape (N, D).
         """
         S = np.asarray(self.init_data.W, dtype=np.float64)   # (h, N, D)
         h, N, D = S.shape
@@ -757,7 +413,7 @@ class GPLM:
         arrays = {
             "R_ix_hNd": np.asarray(self.init_data.R_ix_hNd),
             "R_iX": np.asarray(self.init_data.R_iX),
-            "beta_heads": np.asarray(self.init_data.beta_heads),
+            "β": np.asarray(self.init_data.β),
             "W": np.asarray(self.init_data.W),
         }
         if self.init_data.L is not None:
@@ -779,20 +435,45 @@ class GPLM:
         init_npz = load_npz(local_dir / "init_data.npz")
         params = load_params(local_dir / "params.safetensors")
 
-        obj = cls.__new__(cls)
-        obj.dtype = jnp.float32
-        obj.param_dtype = jnp.float32
-        obj.init_data = GPLMInit(
+        beta_module = cfg["β"]
+        if isinstance(beta_module, list):
+            beta_module = tuple(float(b) for b in beta_module)
+
+        module = gplm(
+            D_head=int(cfg["D_head"]),
+            N=int(cfg["R_iX_shape"][0]),
+            h=int(cfg["h"]),
+            β=beta_module,
+            metric_rank=cfg.get("metric_rank", None),
+            use_W_O=bool(cfg["use_W_O"]),
+            D_out=None if not cfg["use_W_O"] else int(cfg["D_out"]),
+            eps=float(cfg["eps"]),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+
+        h = int(cfg["h"])
+        d = int(cfg["d"])
+        dummy_z = jnp.zeros((1, h, d), dtype=jnp.float32)
+        variables = module.init(jax.random.PRNGKey(int(cfg["seed"])), dummy_z)
+        vars_mut = unfreeze(variables)
+        vars_mut["params"] = params
+        variables = freeze(vars_mut)
+
+        init_data = GPLMInit(
             R_ix_hNd=init_npz["R_ix_hNd"],
             R_iX=init_npz["R_iX"],
-            beta_heads=init_npz["beta_heads"],
+            β=init_npz["β"],
             W=init_npz["W"],
             L=init_npz["L"] if "L" in init_npz else None,
             W_O=init_npz["W_O"] if "W_O" in init_npz else None,
             b_O=init_npz["b_O"] if "b_O" in init_npz else None,
-            cg_info={"per_head": cfg.get("cg_info", [])},
         )
-        obj.variables = {"params": params}
+
+        obj = cls.__new__(cls)
+        obj.module = module
+        obj.variables = variables
+        obj.init_data = init_data
         obj.config = cfg
         return obj
 
