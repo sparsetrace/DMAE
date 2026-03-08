@@ -11,6 +11,11 @@ from flax.core import freeze, unfreeze
 
 from .eager_map import eager_dmap
 from .blocks import dmap
+from .hf_io import (
+    write_json, read_json, save_npz, load_npz,
+    save_params, load_params, write_model_card,
+    hf_upload_folder, hf_download_folder,
+)
 
 
 BetaSpec = Union[float, Tuple[float, ...]]
@@ -236,3 +241,93 @@ class DMAP:
     @classmethod
     def from_eager(cls, *args, **kwargs) -> "DMAP":
         return cls(*args, **kwargs)
+
+
+
+    ############## SAVE
+    def save_pretrained(self, local_dir: str) -> None:
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+    
+        write_json(local_dir / "config.json", {
+            "class_name": "DMAP",
+            "config": self.config,
+        })
+    
+        save_params(local_dir / "params.safetensors", dict(self.variables["params"]))
+    
+        arrays = {
+            "R_iX": np.asarray(self.init_data.R_iX),
+            "β": np.asarray(self.init_data.β),
+            "q": np.asarray(self.init_data.q),
+            "W": np.asarray(self.init_data.W),
+            "λ_x": np.asarray(self.init_data.λ_x),
+            "ψ_ix": np.asarray(self.init_data.ψ_ix),
+        }
+        if self.init_data.L is not None:
+            arrays["L"] = np.asarray(self.init_data.L)
+    
+        save_npz(local_dir / "init_data.npz", arrays)
+        write_model_card(local_dir / "README.md", class_name="DMAP")
+    
+    
+    @classmethod
+    def from_pretrained(cls, local_dir: str) -> "DMAP":
+        local_dir = Path(local_dir)
+    
+        meta = read_json(local_dir / "config.json")
+        cfg = meta["config"]
+        init_npz = load_npz(local_dir / "init_data.npz")
+        params = load_params(local_dir / "params.safetensors")
+    
+        beta_module = cfg["β"]
+        if isinstance(beta_module, list):
+            beta_module = tuple(float(b) for b in beta_module)
+    
+        module = dmap(
+            d=int(cfg["d"]),
+            N=int(cfg["R_iX_shape"][0]),
+            h=int(cfg["h"]),
+            α=float(cfg["α"]),
+            β=beta_module,
+            metric_rank=cfg.get("metric_rank", None),
+            eps=float(cfg["eps"]),
+            dtype=jnp.float32,
+            param_dtype=jnp.float32,
+        )
+    
+        D = int(cfg["R_iX_shape"][1])
+        dummy_x = jnp.zeros((1, D), dtype=jnp.float32)
+        variables = module.init(jax.random.PRNGKey(int(cfg["seed"])), dummy_x)
+        vars_mut = unfreeze(variables)
+        vars_mut["params"] = params
+        variables = freeze(vars_mut)
+    
+        init_data = DMAPInit(
+            R_iX=init_npz["R_iX"],
+            β=init_npz["β"],
+            q=init_npz["q"],
+            W=init_npz["W"],
+            λ_x=init_npz["λ_x"],
+            ψ_ix=init_npz["ψ_ix"],
+            L=init_npz["L"] if "L" in init_npz else None,
+        )
+    
+        obj = cls.__new__(cls)
+        obj.module = module
+        obj.variables = variables
+        obj.init_data = init_data
+        obj.config = cfg
+        return obj
+    
+    
+    def hf_save(self, hf_repo: str, hf_token: str | None = None) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self.save_pretrained(td)
+            hf_upload_folder(td, hf_repo, hf_token, commit_message="Upload DMAP")
+    
+    
+    @classmethod
+    def hf_load(cls, hf_repo: str, hf_token: str | None = None) -> "DMAP":
+        local_dir = hf_download_folder(hf_repo, hf_token)
+        return cls.from_pretrained(local_dir)
