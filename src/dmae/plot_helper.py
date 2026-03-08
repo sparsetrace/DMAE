@@ -125,4 +125,4 @@ def compare_3d_plots(
     )
 
     fig.show()
-    return fig
+    return None
