@@ -142,7 +142,7 @@ def compare_3d_plots(
 
         if show:
             fig.show()
-        return fig
+        return None
 
     elif backend == "matplotlib":
         import matplotlib.pyplot as plt
@@ -199,7 +199,7 @@ def compare_3d_plots(
 
         if show:
             plt.show()
-        return fig
+        return None
 
     else:
         raise ValueError("backend must be either 'plotly' or 'matplotlib'")
